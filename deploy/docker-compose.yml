@@ -1,0 +1,77 @@
+name: jistack-platform-prod
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USERNAME}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    volumes:
+      - prod-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    volumes:
+      - prod-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ../platform-server
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # resources/ 里目前没有 application-prod.yml，这个 profile 暂不改变任何行为；
+      # 一旦加了 prod 专属配置，这里就是让它生效的开关。
+      SPRING_PROFILES_ACTIVE: prod
+      MYSQL_HOST: mysql
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USERNAME: ${MYSQL_USERNAME}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      PLATFORM_MASTER_KEY: ${PLATFORM_MASTER_KEY}
+      PLATFORM_JWT_SECRET: ${PLATFORM_JWT_SECRET}
+      # 必须是开放平台上填的同一个公网 https 域名，授权二维码和回调地址都由它拼出来
+      PLATFORM_SITE_BASE: https://${PLATFORM_DOMAIN}
+      # 微信接口基地址；不在 .env 里设就是官方域名，走自建代理出口时才需要改
+      WECHAT_API_BASE: ${WECHAT_API_BASE:-https://api.weixin.qq.com}
+      TZ: Asia/Shanghai
+
+  # TLS 由宿主机上已有的 nginx 终止，这里只把 web 暴露到本机回环地址，
+  # 站点与 /api/、/wx/ 的分发都在 web 容器内部的 nginx 里做。
+  web:
+    build:
+      context: ../platform-web
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:8088:80"
+
+volumes:
+  prod-mysql-data:
+  prod-redis-data:

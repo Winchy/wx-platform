@@ -1,0 +1,271 @@
+package com.jistack.platform.module.system;
+
+import com.jistack.platform.common.web.ApiResponse;
+import com.jistack.platform.common.web.BizException;
+import com.jistack.platform.common.web.GlobalExceptionHandler;
+import com.jistack.platform.common.web.PageResult;
+import com.jistack.platform.module.authorizer.AuthorizerController;
+import com.jistack.platform.module.authorizer.AuthorizerService;
+import com.jistack.platform.module.authorizer.MiniProgramSettingController;
+import com.jistack.platform.module.authorizer.MiniProgramSettingService;
+import com.jistack.platform.module.event.WechatCallbackController;
+import com.jistack.platform.module.release.AppRelease;
+import com.jistack.platform.module.release.CommitRequest;
+import com.jistack.platform.module.release.ReleaseController;
+import com.jistack.platform.module.release.ReleaseService;
+import com.jistack.platform.wechat.client.WechatApiException;
+import com.jistack.platform.wechat.service.WeChatCallbackService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.springframework.http.MediaType;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+/**
+ * 只测 Web 层契约：请求体绑定（含 transient 凭据字段）、响应信封、错误码映射。
+ * 用 standalone MockMvc，避免依赖 MySQL/Redis。
+ */
+class PlatformWebContractTest {
+
+    private PlatformConfigService configService;
+    private AuthorizerService authorizerService;
+    private ReleaseService releaseService;
+    private MiniProgramSettingService settingService;
+    private WeChatCallbackService callbackService;
+    private MockMvc mvc;
+
+    @BeforeEach
+    void setUp() {
+        configService = mock(PlatformConfigService.class);
+        authorizerService = mock(AuthorizerService.class);
+        releaseService = mock(ReleaseService.class);
+        settingService = mock(MiniProgramSettingService.class);
+        callbackService = mock(WeChatCallbackService.class);
+        mvc = MockMvcBuilders
+                .standaloneSetup(new PlatformConfigController(configService, authorizerService),
+                        new AuthorizerController(authorizerService),
+                        new ReleaseController(releaseService),
+                        new MiniProgramSettingController(settingService),
+                        new WechatCallbackController(callbackService,
+                                mock(com.jistack.platform.wechat.service.AuthorizationService.class)))
+                .setControllerAdvice(new GlobalExceptionHandler())
+                .build();
+    }
+
+    @Test
+    @DisplayName("PUT /api/platform/config：明文密钥能绑定进来，响应只回掩码状态")
+    void updatePlatformConfig() throws Exception {
+        when(configService.toVO()).thenReturn(Map.of("componentAppid", "wx1", "secretSet", true,
+                "callbackUrl", "https://p.example.com/wx/callback"));
+
+        mvc.perform(put("/api/platform/config").contentType(MediaType.APPLICATION_JSON).content("""
+                {"componentAppid":"wx1","componentSecret":"plain-secret",
+                 "messageToken":"tok","encodingAesKey":"0123456789012345678901234567890123456789012"}
+                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.secretSet").value(true))
+                .andExpect(jsonPath("$.data.callbackUrl").value("https://p.example.com/wx/callback"))
+                .andExpect(jsonPath("$.data.componentSecret").doesNotExist());
+
+        ArgumentCaptor<PlatformConfig> captor = ArgumentCaptor.forClass(PlatformConfig.class);
+        verify(configService).update(captor.capture());
+        assertThat(captor.getValue().getComponentSecret()).isEqualTo("plain-secret");
+        assertThat(captor.getValue().getEncodingAesKey()).hasSize(43);
+    }
+
+    @Test
+    @DisplayName("微信把 URL 里的 $APPID$ 换成实际 appid，/wx/callback/{appid} 不能 404")
+    void callbackAcceptsAppidPathSuffix() throws Exception {
+        when(callbackService.handlePush(any(), any(), any(), any())).thenReturn("success");
+        when(callbackService.verifyUrl(any(), any(), any(), any())).thenReturn("ECHO_1");
+
+        mvc.perform(post("/wx/callback/wx9a1b2c3d4e5f6071")
+                        .param("msg_signature", "sig").param("timestamp", "1763000000").param("nonce", "n")
+                        .contentType(MediaType.TEXT_PLAIN).content("<xml><Encrypt>x</Encrypt></xml>"))
+                .andExpect(status().isOk())
+                .andExpect(content().string("success"));
+
+        verify(callbackService).handlePush("sig", "1763000000", "n", "<xml><Encrypt>x</Encrypt></xml>");
+
+        mvc.perform(get("/wx/callback/wx9a1b2c3d4e5f6071")
+                        .param("signature", "sig").param("timestamp", "1763000000")
+                        .param("nonce", "n").param("echostr", "e"))
+                .andExpect(status().isOk())
+                .andExpect(content().string("ECHO_1"));
+    }
+
+    @Test
+    @DisplayName("ticket 未到时微信侧异常按 errcode 返回，HTTP 仍是 200，前端按 code 提示")
+    void wechatErrorSurfacesAsErrcode() throws Exception {
+        when(authorizerService.restartTicketPush())
+                .thenThrow(new WechatApiException(61023, "refresh_token is invalid", "/cgi-bin/component/x"));
+
+        mvc.perform(post("/api/platform/ticket-push/restart"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(61023))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("61023")));
+    }
+
+    @Test
+    @DisplayName("未接入小程序：BizException(404) → HTTP 404 + code 404")
+    void notFoundMapping() throws Exception {
+        when(authorizerService.detail("wxmissing")).thenThrow(BizException.notFound("小程序 wxmissing 尚未接入"));
+
+        mvc.perform(get("/api/authorizers/wxmissing"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value(404));
+    }
+
+    @Test
+    @DisplayName("GET /api/authorizers/{appid}/icp-status 返回解码后的备案状态")
+    void icpStatusRoute() throws Exception {
+        when(releaseService.icpStatus("wx1")).thenReturn(Map.of(
+                "status", 1026,
+                "statusText", "未备案",
+                "filed", false,
+                "missingPrerequisites", List.of("没有审核通过的小程序类目")));
+
+        mvc.perform(get("/api/authorizers/wx1/icp-status"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.status").value(1026))
+                .andExpect(jsonPath("$.data.filed").value(false))
+                .andExpect(jsonPath("$.data.missingPrerequisites[0]").value("没有审核通过的小程序类目"));
+
+        verify(releaseService).icpStatus("wx1");
+    }
+
+    @Test
+    @DisplayName("POST /visit-status：action 能绑定，响应是改完后重读的状态")
+    void visitStatusWriteRoute() throws Exception {
+        when(releaseService.setVisitStatus("wx1", "close")).thenReturn(0);
+
+        mvc.perform(post("/api/authorizers/wx1/visit-status").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"action\":\"close\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data").value(0));
+
+        verify(releaseService).setVisitStatus("wx1", "close");
+    }
+
+    @Test
+    @DisplayName("GET /audit/screenshots：返回 mediaId + dataUrl 列表")
+    void auditScreenshotsRoute() throws Exception {
+        when(releaseService.auditScreenshots("wx1")).thenReturn(List.of(Map.of(
+                "mediaId", "aaa", "contentType", "image/png", "dataUrl", "data:image/png;base64,AAAA")));
+
+        mvc.perform(get("/api/authorizers/wx1/audit/screenshots"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data[0].mediaId").value("aaa"))
+                .andExpect(jsonPath("$.data[0].dataUrl").value("data:image/png;base64,AAAA"));
+    }
+
+    @Test
+    @DisplayName("隐私指引路由：GET 绑定 privacyVer，PUT 的字段名与前端一致并原样透传")
+    void privacySettingRoutes() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        when(settingService.privacySetting("wx1", 2)).thenReturn(
+                mapper.readTree("{\"errcode\":0,\"code_exist\":1,\"privacy_list\":[\"UserInfo\"]}"));
+        when(settingService.updatePrivacySetting(eq("wx1"), eq(2), any(), any())).thenReturn(
+                mapper.readTree("{\"errcode\":0,\"errmsg\":\"ok\"}"));
+
+        mvc.perform(get("/api/authorizers/wx1/privacy-setting").param("privacyVer", "2"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.code_exist").value(1))
+                .andExpect(jsonPath("$.data.privacy_list[0]").value("UserInfo"));
+
+        mvc.perform(put("/api/authorizers/wx1/privacy-setting").contentType(MediaType.APPLICATION_JSON).content("""
+                {"privacyVer":2,
+                 "settingList":[{"privacy_key":"UserInfo","privacy_text":"用来展示会员昵称与头像"}],
+                 "ownerSetting":{"notice_method":"弹窗","contact_email":"privacy@example.org"}}
+                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.errcode").value(0));
+
+        verify(settingService).updatePrivacySetting("wx1", 2,
+                List.of(Map.of("privacy_key", "UserInfo", "privacy_text", "用来展示会员昵称与头像")),
+                Map.of("notice_method", "弹窗", "contact_email", "privacy@example.org"));
+    }
+
+    @Test
+    @DisplayName("列表分页信封 {code,message,data:{records,total,page,size}}")
+    void pageEnvelope() throws Exception {
+        when(authorizerService.page(eq("协会"), any(), eq(1L), eq(20L))).thenReturn(
+                new PageResult<>(List.of(Map.of("appid", "wx1", "nickName", "示例协会")), 1, 1, 20));
+
+        mvc.perform(get("/api/authorizers").param("keyword", "协会"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.records[0].appid").value("wx1"))
+                .andExpect(jsonPath("$.data.total").value(1))
+                .andExpect(jsonPath("$.data.size").value(20));
+    }
+
+    @Test
+    @DisplayName("上传代码：record 请求体的 templateId / extJson / userVersion 能绑定")
+    void commitBinding() throws Exception {
+        AppRelease release = new AppRelease();
+        release.setStatus("COMMITTED");
+        release.setUserVersion("1.2.0");
+        when(releaseService.commit(eq("wx1"), any())).thenReturn(release);
+
+        mvc.perform(post("/api/authorizers/wx1/code").contentType(MediaType.APPLICATION_JSON).content("""
+                {"templateId":"TPL1","userVersion":"1.2.0","userDesc":"迭代","ext":{"apiBase":"https://a.example.com"}}
+                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("COMMITTED"))
+                .andExpect(jsonPath("$.data.userVersion").value("1.2.0"));
+
+        ArgumentCaptor<CommitRequest> captor = ArgumentCaptor.forClass(CommitRequest.class);
+        verify(releaseService).commit(eq("wx1"), captor.capture());
+        assertThat(captor.getValue().templateId()).isEqualTo("TPL1");
+        assertThat(captor.getValue().ext()).containsEntry("apiBase", "https://a.example.com");
+        assertThat(captor.getValue().extJson()).isNull();
+    }
+
+    @Test
+    @DisplayName("体验版二维码直接返回图片字节，不套信封")
+    void qrcodeIsRawImage() throws Exception {
+        when(releaseService.experienceQrcode("wx1", null)).thenReturn(new byte[] {(byte) 0x89, 'P', 'N', 'G', 1});
+
+        mvc.perform(get("/api/authorizers/wx1/experience-qrcode"))
+                .andExpect(status().isOk())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers
+                        .content().contentType(MediaType.IMAGE_PNG))
+                .andExpect(result -> assertThat(((byte[]) result.getResponse()
+                        .getContentAsByteArray())).hasSize(5));
+    }
+
+    @Test
+    @DisplayName("ApiResponse 里 null data 不输出，前端按 code 判成功")
+    void okWithoutData() throws Exception {
+        when(configService.recentTickets(20)).thenReturn(List.of());
+
+        mvc.perform(get("/api/platform/tickets"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(ApiResponse.OK))
+                .andExpect(jsonPath("$.data").isArray());
+    }
+}

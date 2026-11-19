@@ -1,0 +1,48 @@
+name: jistack-platform
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: platform-mysql
+    restart: unless-stopped
+    # 下面两个值只在数据目录为空时生效一次；已有实例要改，得进去
+    # ALTER USER / CREATE DATABASE，改这里不会同步过去。
+    environment:
+      MYSQL_ROOT_PASSWORD: jistack
+      MYSQL_DATABASE: jistack_platform
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - platform-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pjistack"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: platform-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - platform-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+# 卷名带项目前缀，项目名从 association-platform 改成 jistack-platform 后指向的是新空卷，
+# 旧数据仍在 association-platform_platform-mysql-data 里。要沿用：mysqldump 导给新实例，
+# 或在这里加 name: association-platform_platform-mysql-data 显式指过去。
+volumes:
+  platform-mysql-data:
+  platform-redis-data:

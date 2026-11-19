@@ -1,0 +1,17 @@
+# 端到端测试专用 profile：连本机 MySQL/Redis（docker compose 起的默认实例），
+# 库名随机生成、跑完即弃，避免污染开发数据。
+spring:
+  flyway:
+    enabled: true
+    clean-disabled: true
+  data:
+    redis:
+      database: 9
+
+platform:
+  master-key: ZTJlVGVzdE1hc3RlcktleTMyYnl0ZXNMb25nISEhISE=
+  security:
+    jwt-secret: e2e-test-jwt-secret-please-do-not-reuse-in-production
+  wechat:
+    # 测试里通过平台配置接口把 api_base 改写到桩服务，这里保留默认值即可
+    site-base: https://e2e.example.com
