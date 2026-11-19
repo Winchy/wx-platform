@@ -1,11 +1,11 @@
 # 后端镜像：构建阶段用 Maven，运行阶段只留 JRE。
-FROM maven:3.9-eclipse-temurin-21 AS build
+FROM docker.m.daocloud.io/library/maven:3.9-eclipse-temurin-21 AS build
 WORKDIR /src
 COPY pom.xml ./
 COPY src ./src
 RUN mvn -B -DskipTests package
 
-FROM eclipse-temurin:21-jre-jammy
+FROM docker.m.daocloud.io/library/eclipse-temurin:21-jre-jammy
 WORKDIR /app
 ENV TZ=Asia/Shanghai \
     JAVA_OPTS="-XX:MaxRAMPercentage=75 -Duser.timezone=Asia/Shanghai"

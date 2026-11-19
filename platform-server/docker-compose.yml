@@ -2,7 +2,7 @@ name: jistack-platform
 
 services:
   mysql:
-    image: mysql:8.0
+    image: docker.m.daocloud.io/library/mysql:8.0
     container_name: platform-mysql
     restart: unless-stopped
     # 下面两个值只在数据目录为空时生效一次；已有实例要改，得进去
@@ -26,7 +26,7 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    image: docker.m.daocloud.io/library/redis:7-alpine
     container_name: platform-redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
