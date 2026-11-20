@@ -8,17 +8,18 @@ import {
   listAllCategories,
   listCategories,
   removeCategory,
-  type AuthorizerCategory
+  type AuthorizerCategory,
+  type CategoryTreeNode
 } from '@/api/config'
 import { EmptyState } from '@/components'
 import {
-  categoryDepth,
+  categoryAuditReason,
+  categoryAuditText,
+  categoryAuditType,
   categoryPathIds,
   categoryPathText,
-  firstThirdId,
-  normalizeCategoryTree,
-  toCascaderOptions,
-  type CategoryNode
+  nodeAt,
+  toCascaderOptions
 } from '@/utils/category'
 import { describeError } from '@/utils/request'
 
@@ -31,12 +32,18 @@ const quotaText = ref('')
 
 const treeLoading = ref(false)
 const treeError = ref('')
-const tree = ref<CategoryNode[]>([])
+const tree = ref<CategoryTreeNode[]>([])
 
 const adding = ref(false)
 const form = reactive<{ path: number[] }>({ path: [] })
 
 const cascaderOptions = computed(() => toCascaderOptions(tree.value))
+
+/** 选中的最深一级：敏感类目要交哪些资质文件，微信在类目树里就给了 */
+const selectedQualify = computed<string[]>(() => {
+  const node = nodeAt(tree.value, form.path)
+  return node && node.sensitiveType === 1 ? node.qualifyNames ?? [] : []
+})
 
 const cascaderProps = {
   value: 'value',
@@ -72,7 +79,7 @@ async function loadTree(): Promise<void> {
   treeLoading.value = true
   treeError.value = ''
   try {
-    tree.value = normalizeCategoryTree(await listAllCategories(props.appid))
+    tree.value = (await listAllCategories(props.appid)) ?? []
   } catch (err) {
     treeError.value = describeError(err)
     tree.value = []
@@ -109,13 +116,12 @@ async function onAdd(): Promise<void> {
 }
 
 async function onRemove(category: AuthorizerCategory): Promise<void> {
-  const first = category.first?.id
-  const second = category.second?.id
-  if (first === undefined || second === undefined) {
-    ElMessage.warning('该类目缺少一二级 ID，无法删除')
+  const first = category.firstId
+  const second = category.secondId
+  if (!first || !second) {
+    ElMessage.warning('该类目缺少一二级编号，无法删除')
     return
   }
-  const third = firstThirdId(category)
   try {
     await ElMessageBox.confirm(`确认删除类目「${categoryPathText(category)}」？`, '删除类目', {
       type: 'warning',
@@ -126,7 +132,7 @@ async function onRemove(category: AuthorizerCategory): Promise<void> {
     return
   }
   try {
-    await removeCategory(props.appid, { first, second, third })
+    await removeCategory(props.appid, { first, second })
     ElMessage.success('类目已删除')
     await loadCategories()
   } catch (err) {
@@ -167,12 +173,23 @@ defineExpose({ reload: refreshAll })
               <div class="flex-col" style="gap: 2px">
                 <span class="strong">{{ categoryPathText(rowAt($index)) || '未命名类目' }}</span>
                 <span class="mono muted">{{ categoryPathIds(rowAt($index)) }}</span>
+                <span v-if="categoryAuditReason(rowAt($index))" class="category-tab__reason">
+                  {{ categoryAuditReason(rowAt($index)) }}
+                </span>
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="层级" width="90">
+          <el-table-column label="审核状态" width="110">
             <template #default="{ $index }: { $index: number }">
-              <span class="muted">{{ categoryDepth(rowAt($index)) }} 级</span>
+              <el-tag
+                v-if="categoryAuditText(rowAt($index))"
+                :type="categoryAuditType(rowAt($index))"
+                size="small"
+                effect="light"
+              >
+                {{ categoryAuditText(rowAt($index)) }}
+              </el-tag>
+              <span v-else class="muted">—</span>
             </template>
           </el-table-column>
           <el-table-column label="操作" width="80" align="right">
@@ -205,7 +222,7 @@ defineExpose({ reload: refreshAll })
         />
 
         <el-form label-position="top" @submit.prevent="onAdd">
-          <el-form-item label="选择类目（一级 / 二级 / 三级）">
+          <el-form-item label="选择类目（微信只给到一级 / 二级）">
             <el-cascader
               v-model="form.path"
               :options="cascaderOptions"
@@ -213,20 +230,29 @@ defineExpose({ reload: refreshAll })
               :loading="treeLoading"
               clearable
               filterable
-              placeholder="例如：社会组织 / 协会 / 商会"
+              placeholder="可选类目由微信按主体类型下发，需选到二级"
               style="width: 100%"
             />
           </el-form-item>
+          <div v-if="selectedQualify.length" class="category-tab__qualify mb-12">
+            <span class="strong">该类目需提交资质：</span>
+            <span>{{ selectedQualify.join('、') }}</span>
+            <p class="muted">
+              站内还不能上传资质图片，直接提交微信会返回 53311（需要提交资料信息）；请先在小程序后台「设置 → 基本设置 →
+              服务类目」提交该类目与资质。
+            </p>
+          </div>
           <el-form-item>
             <el-button type="primary" :loading="adding" :icon="Plus" @click="onAdd">提交类目</el-button>
             <span class="muted category-tab__tip">
-              部分类目提交后需微信审核，审核通过才会出现在左侧列表。
+              部分类目提交后需微信审核，审核结果（审核中 / 不通过及原因）会显示在左侧列表。
             </span>
           </el-form-item>
         </el-form>
 
         <div v-if="!cascaderOptions.length && !treeLoading && !treeError" class="muted category-tab__tip">
-          未从 GET /api/authorizers/{appid}/all-categories 解析出类目树，请确认后端返回结构与文档一致。
+          微信没有下发这个主体的可选类目。不同主体类型允许设置的类目不同；若授权时未勾选类目管理相关权限集（接口归属权限集
+          id 30），请在「扫码授权」页重新授权后刷新本页。
         </div>
       </section>
     </div>
@@ -244,6 +270,20 @@ defineExpose({ reload: refreshAll })
 
 .category-tab__tip {
   font-size: 12px;
+  line-height: 1.6;
+}
+
+.category-tab__reason {
+  font-size: 12px;
+  color: var(--el-color-warning);
+}
+
+.category-tab__qualify {
+  padding: 8px 10px;
+  border: 1px solid var(--el-color-warning-light-7);
+  border-radius: 6px;
+  background: var(--el-color-warning-light-9);
+  font-size: 13px;
   line-height: 1.6;
 }
 </style>

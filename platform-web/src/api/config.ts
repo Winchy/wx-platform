@@ -115,16 +115,15 @@ export interface WebviewConfirmFile {
 
 /* ---------------- 类目 ---------------- */
 
-export interface CategoryRef {
-  id: number
-  name: string
-}
-
-/** 微信返回的已选类目：first/second 为对象，third 为数组（可能为空） */
+/** 微信 getcategory 的一行就是一级 + 二级编号与名称，再带这次的审核结论 */
 export interface AuthorizerCategory {
-  first: CategoryRef | null
-  second: CategoryRef | null
-  third: CategoryRef[] | null
+  firstId: number
+  firstName: string
+  secondId: number
+  secondName: string
+  /** 1 审核中 / 2 审核不通过 / 3 审核通过 */
+  auditStatus: number
+  auditReason: string
 }
 
 export interface CategoryListResult {
@@ -134,10 +133,22 @@ export interface CategoryListResult {
   categoryLimit: number
 }
 
+/** 后端已把微信的扁平类目表按 father 组装成树；微信文档只保证一级 + 二级 */
+export interface CategoryTreeNode {
+  id: number
+  name: string
+  level: number
+  /** 1 = 敏感类目，要交资质材料；0 = 无需审核 */
+  sensitiveType: number
+  qualifyNames: string[]
+  children: CategoryTreeNode[]
+}
+
 export interface CategoryAddParams {
   first: number
   second: number
   third?: number
+  /** 微信拼写是 certicates，每项 {key: 资质名称, value: media_id} */
   certificates?: Array<Record<string, unknown>>
 }
 
@@ -146,9 +157,6 @@ export interface CategoryRemoveParams {
   second: number
   third?: number
 }
-
-/** /all-categories 结构由微信决定，交给 utils/category 归一化 */
-export type RawCategoryTree = unknown
 
 /* ---------------- 体验成员 ---------------- */
 
@@ -263,8 +271,9 @@ export function listCategories(appid: string): Promise<CategoryListResult> {
   return get<CategoryListResult>(`/authorizers/${appid}/categories`)
 }
 
-export function listAllCategories(appid: string): Promise<RawCategoryTree> {
-  return get<RawCategoryTree>(`/authorizers/${appid}/all-categories`)
+/** 可选类目树：后端已按微信的 father 关系组装好，直接喂给级联选择器 */
+export function listAllCategories(appid: string): Promise<CategoryTreeNode[]> {
+  return get<CategoryTreeNode[]>(`/authorizers/${appid}/all-categories`)
 }
 
 export function addCategory(appid: string, params: CategoryAddParams): Promise<JsonNode> {

@@ -343,7 +343,7 @@ class WechatApiContractTest {
     @Test
     @DisplayName("类目接口在 /cgi-bin/wxopen/ 下")
     void categoryPathsAreUnderWxopen() throws Exception {
-        ok("{\"errcode\":0,\"category_list\":[]}");
+        ok("{\"errcode\":0,\"categories_list\":{\"categories\":[]}}");
 
         MiniProgramApi.addCategory(api, AUTHORIZER_TOKEN, List.of(Map.of("first", 1, "second", 2)));
 

@@ -157,8 +157,9 @@ public class MiniProgramSettingController {
         return ApiResponse.ok(settingService.categories(appid));
     }
 
+    /** 可选类目树：微信给的是按 father 关联的扁平表，后端已组装成「一级 → 二级」的 children 结构。 */
     @GetMapping("/all-categories")
-    public ApiResponse<JsonNode> allCategories(@PathVariable String appid) {
+    public ApiResponse<List<Map<String, Object>>> allCategories(@PathVariable String appid) {
         return ApiResponse.ok(settingService.allCategories(appid));
     }
 

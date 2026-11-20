@@ -206,12 +206,30 @@ class MockWeChatServer extends Dispatcher {
                     "file_name", "mock-confirm.txt", "file_content", "mock-confirm-file");
             case "addcategory", "deletecategory" -> json("errcode", 0, "errmsg", "ok");
             case "getcategory" -> flat("""
-                    {"errcode":0,"errmsg":"ok","categories":[{"id":1,"name":"医疗服务","level":1}],
-                     "limit":5,"quota":4,"category_limit":5}
+                    {"errcode":0,"errmsg":"ok","categories":[
+                      {"first":8,"first_name":"教育","second":39,"second_name":"出国移民",
+                       "audit_status":1,"audit_reason":""},
+                      {"first":1,"first_name":"快递业与邮政","second":5,"second_name":"邮政",
+                       "audit_status":2,"audit_reason":"主体经营范围与所选类目描述不一致"}],
+                     "limit":5,"quota":4,"category_limit":20}
                     """);
+            // 文档形状：扁平表 + id=0 的根节点，children 是子类目 ID 数组，层级靠 father 关联
             case "getallcategories" -> flat("""
-                    {"errcode":0,"errmsg":"ok","category_list":[
-                      {"id":"1","name":"医疗服务","levels":[1],"description":"","sensitive_auth":0}]}
+                    {"errcode":0,"errmsg":"ok","categories_list":{"categories":[
+                      {"id":0,"children":[1,8],"qualify":{"exter_list":[],"remark":""}},
+                      {"id":1,"name":"快递业与邮政","level":1,"father":0,"children":[2,5],
+                       "sensitive_type":0,"qualify":{"exter_list":[],"remark":""}},
+                      {"id":2,"name":"快递收派","level":2,"father":1,"children":[],
+                       "sensitive_type":0,"qualify":{"exter_list":[],"remark":""}},
+                      {"id":5,"name":"邮政","level":2,"father":1,"children":[],
+                       "sensitive_type":0,"qualify":{"exter_list":[],"remark":""}},
+                      {"id":8,"name":"教育","level":1,"father":0,"children":[39],
+                       "sensitive_type":0,"qualify":{"exter_list":[],"remark":""}},
+                      {"id":39,"name":"出国移民","level":2,"father":8,"children":[],
+                       "sensitive_type":1,
+                       "qualify":{"exter_list":[{"inner_list":[
+                         {"name":"《因私出入境中介机构经营许可证》","url":""}]}],"remark":""}}
+                    ]}}
                     """);
             case "setnickname" -> json("errcode", 0, "errmsg", "ok", "wording", "",
                     "audit_id", 300001);

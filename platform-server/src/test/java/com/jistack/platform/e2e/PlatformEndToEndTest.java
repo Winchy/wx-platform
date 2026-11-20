@@ -808,10 +808,21 @@ class PlatformEndToEndTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.message", Matchers.containsString("域名类型")));
 
-        assertThat(api(HttpMethod.GET, "/api/authorizers/" + AUTHORIZER_APPID + "/categories", null)
-                .path("categories").get(0).path("name").asText()).isEqualTo("医疗服务");
-        assertThat(api(HttpMethod.GET, "/api/authorizers/" + AUTHORIZER_APPID + "/all-categories", null)
-                .path("category_list").get(0).path("name").asText()).isEqualTo("医疗服务");
+        JsonNode settings = api(HttpMethod.GET, "/api/authorizers/" + AUTHORIZER_APPID + "/categories", null);
+        assertThat(settings.path("categories").get(0).path("firstName").asText()).isEqualTo("教育");
+        assertThat(settings.path("categories").get(0).path("secondName").asText()).isEqualTo("出国移民");
+        assertThat(settings.path("categories").get(1).path("auditStatus").asInt()).isEqualTo(2);
+        assertThat(settings.path("categories").get(1).path("auditReason").asText()).contains("经营范围");
+        assertThat(settings.path("categoryLimit").asInt()).isEqualTo(20);
+
+        // 微信给的是按 father 关联的扁平表，后端要组装成级联能直接用的树：根节点 id=0 不能出现在结果里
+        JsonNode tree = api(HttpMethod.GET, "/api/authorizers/" + AUTHORIZER_APPID + "/all-categories", null);
+        assertThat(tree).hasSize(2);
+        assertThat(tree.get(0).path("name").asText()).isEqualTo("快递业与邮政");
+        assertThat(tree.get(0).path("children").get(1).path("name").asText()).isEqualTo("邮政");
+        assertThat(tree.get(1).path("children").get(0).path("sensitiveType").asInt()).isEqualTo(1);
+        assertThat(tree.get(1).path("children").get(0).path("qualifyNames").get(0).asText())
+                .isEqualTo("《因私出入境中介机构经营许可证》");
         assertThat(api(HttpMethod.POST, "/api/authorizers/" + AUTHORIZER_APPID + "/categories",
                 Map.of("first", 1, "second", 2)).path("errcode").asInt()).isZero();
 

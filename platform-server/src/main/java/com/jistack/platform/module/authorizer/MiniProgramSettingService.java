@@ -537,18 +537,95 @@ public class MiniProgramSettingService {
 
     // -------------------------------------------------- 类目
 
+    /** 微信给的是扁平的一二级编号加名称/审核结论（first、first_name、second、second_name、audit_status、audit_reason）。 */
     public Map<String, Object> categories(String appid) {
         JsonNode node = caller.authorizer(appid, "getcategory", MiniProgramApi::categories);
+        List<Map<String, Object>> items = new ArrayList<>();
+        node.path("categories").forEach(item -> {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("firstId", item.path("first").asInt(0));
+            row.put("firstName", item.path("first_name").asText(""));
+            row.put("secondId", item.path("second").asInt(0));
+            row.put("secondName", item.path("second_name").asText(""));
+            row.put("auditStatus", item.path("audit_status").asInt(0));
+            row.put("auditReason", item.path("audit_reason").asText(""));
+            items.add(row);
+        });
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("categories", node.path("categories"));
+        result.put("categories", items);
         result.put("limit", node.path("limit").asInt(0));
         result.put("quota", node.path("quota").asInt(0));
         result.put("categoryLimit", node.path("category_limit").asInt(0));
         return result;
     }
 
-    public JsonNode allCategories(String appid) {
-        return caller.authorizer(appid, "getallcategories", MiniProgramApi::allCategories);
+    /**
+     * 可选类目树。微信给的是扁平表：每行 {@code {id, name, level, father, children:[子类目 id]}}，
+     * 且 id=0 那行是根节点、它的 children 才是一级类目，界面要的是「一级 / 二级」级联，所以必须按 father 组装。
+     * 层级不写死：微信哪天返回三级，按 father 组装就自然多出第三级。
+     */
+    public List<Map<String, Object>> allCategories(String appid) {
+        JsonNode node = caller.authorizer(appid, "getallcategories", MiniProgramApi::allCategories);
+        JsonNode list = node.path("categories_list").path("categories");
+        if (!list.isArray()) {
+            throw new BizException("微信没有按文档返回 categories_list.categories，实际收到的字段是 "
+                    + String.join("、", fieldNames(node)) + "，无法组装可选类目树");
+        }
+
+        Map<Integer, Map<String, Object>> byId = new LinkedHashMap<>();
+        List<Map.Entry<Integer, Integer>> fathers = new ArrayList<>();
+        for (JsonNode item : list) {
+            int id = item.path("id").asInt(-1);
+            // 根节点只有 id 与 children，没有名称，它的一级子类目在下面按 father 归位
+            if (id <= 0) {
+                continue;
+            }
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("id", id);
+            row.put("name", item.path("name").asText(""));
+            row.put("level", item.path("level").asInt(0));
+            row.put("sensitiveType", item.path("sensitive_type").asInt(0));
+            row.put("qualifyNames", qualifyNames(item.path("qualify")));
+            row.put("children", new ArrayList<Map<String, Object>>());
+            byId.put(id, row);
+            fathers.add(Map.entry(id, item.path("father").asInt(0)));
+        }
+
+        List<Map<String, Object>> roots = new ArrayList<>();
+        for (Map.Entry<Integer, Integer> entry : fathers) {
+            Map<String, Object> row = byId.get(entry.getKey());
+            Map<String, Object> parent = byId.get(entry.getValue());
+            if (parent == null) {
+                roots.add(row);
+            } else {
+                children(parent).add(row);
+            }
+        }
+        return roots;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> children(Map<String, Object> node) {
+        return (List<Map<String, Object>>) node.get("children");
+    }
+
+    /** 敏感类目要交哪些资质文件，微信放在 qualify.exter_list[].inner_list[].name，界面得提前告诉商家。 */
+    private static List<String> qualifyNames(JsonNode qualify) {
+        List<String> names = new ArrayList<>();
+        qualify.path("exter_list").forEach(outer ->
+                outer.path("inner_list").forEach(inner -> {
+                    String name = inner.path("name").asText("");
+                    if (!name.isBlank() && !names.contains(name)) {
+                        names.add(name);
+                    }
+                }));
+        return names;
+    }
+
+    private static List<String> fieldNames(JsonNode node) {
+        List<String> names = new ArrayList<>();
+        node.fieldNames().forEachRemaining(names::add);
+        return names;
     }
 
     public JsonNode addCategory(String appid, Integer first, Integer second, Integer third,

@@ -143,7 +143,8 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
    - 小程序的开发与管理（`1`）
    - 小程序的基本信息设置（`4`）
    - 小程序的服务器域名/业务域名配置（`3`）
-   - 小程序的类目管理（`17`）
+   - 小程序的服务类目查询与设置（`30`）：`getallcategories`、`getcategory`、`addcategory`、`deletecategory`、`modifycategory`
+     五份文档标注的都是权限集 `30`（此前这里写的 `17` 在任何一份缓存文档里都找不到出处，已从界面可选项里删掉）
    站内「发布工作台」顶部会显示该小程序实际授予的权限集 id，缺 `18` 时直接弹提示；缺权限的调用报 `48001`。
    「扫码授权」页也可以直接指定权限集（链接带 `category_id_list=18|1`，中竖线分隔），但指定后管理员**只能**授权所选这几项，
    所以界面默认留空＝已发布的全部权限集，只在补齐权限时按需指定。
@@ -236,30 +237,48 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
   健康检查改打独立的 `GET /wx/health`；缺参/无映射各有一行日志的处理器；`BizException` 现在也记一行 WARN（以前界面显示中文原因、日志完全空白）。
 - GET URL 校验的签名参数名随加解密方式不同：普通模式放 `signature`，安全模式放 `msg_signature`（与 POST 推送同名）。
   只读其中一个，另一种模式下签名恒校验失败、开放平台后台就保存不了回调地址，所以两个都取。
+- 服务类目**不是嵌套树**：`getallcategories`（权限集 `30`）给的是扁平表
+  `{categories_list:{categories:[{id, name, level, father, children:[子类目 ID 数组], sensitive_type, qualify}]}}`，
+  其中 `id=0` 那条是**没有名称的根节点**、它的 children 才是一级类目，层级靠 `father` 关联而不是固定写死两层；
+  文档同时写明「仅支持获取一级类目和二级类目」，所以级联选择器每一级都允许单独选中（`checkStrictly`）。
+  现在由后端 `allCategories` 按 `father` 组装成一级 → 二级的 `children` 结构再交给前端（与本项目「微信下划线字段 ↔ 界面驼峰字段」的既有约定一致，
+  也才能用 `MiniProgramSettingMappingTest` 守住）；文档里的 `categories_list.categories` 缺席时抛 `BizException` 并列出**实际收到的字段名**，
+  不再回空数组让级联框静默空白——此前前端自造了一套 `sub_categories/children/list/items` 猜测键名，后端只是透传，
+  于是「前端假设的形状」悄悄变成事实上的接口规范，界面表现为「无法选择类目」却没有任何地方报错。
+- `getcategory`（已设置类目）也是扁平的：`{categories:[{first, first_name, second, second_name, audit_status, audit_reason}], limit, quota, category_limit}`，
+  一二级各是「编号 + 名称」两列，不是 `{first:{id,name}}` 对象（按对象解析会得到一串「未命名类目」，删除按钮也因为拿不到 ID 而无法工作）；
+  `audit_status` 是 `1 审核中 / 2 审核不通过 / 3 审核通过`，不通过时 `audit_reason` 是微信给的中文原因，界面上的「审核状态」列按这三值显示并附原因。
+- 类目的写接口字段名一律照抄微信：`addcategory` 的 body 是 `{categories:[{first, second, certicates:[{key, value}]}]}`
+  （**`certicates` 是微信文档自己的拼写**，`key` 是资质名称、`value` 是素材 media_id；文档没有 `third`，站内传的 `third` 只在有值时附带），
+  `deletecategory` / `modifycategory` 是 `{first, second}`；站内 REST 层把删除的三个参数放在 query 上（`?first=&second=&third=`），
+  因为只有到微信那一层才是 JSON body。
+- `sensitive_type=1` 的类目**必须随提交附上资质**（`qualify.exter_list[].inner_list[].name` 就是需要的证件名称，如《律师执业资格证》），
+  而站内还没有资质图片上传与 `media_id` 换取入口，直接提交微信回 **`53311 需要提交资料信息`**。
+  现在选中此类类目时界面会列出需要的资质名并说明这一后果、引导先到小程序后台提交，而不是让用户对着一个不明的错误码猜。
 
 ## 6. 测试
 
 ```bash
-mvn -B test          # 210 个用例：192 个无需中间件 + 18 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
+mvn -B test          # 213 个用例：195 个无需中间件 + 18 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
 ```
 
 | 测试类 | 锁住的东西 |
 | --- | --- |
 | `WeChatMsgCryptTest` | 安全模式签名与加解密闭环（回调 URL 校验、ticket 解密） |
-| `WechatApiContractTest` | 每个微信接口的路径、鉴权参数放哪、请求体字段名与类型（`auditid` 必须是 number，不是字符串）；图片抓取主机白名单（放行 `*.qpic.cn`/`*.qlogo.cn`/`*.weixin.qq.com`/桩主机，CDN 的 http 改写成 https，`mmbiz.qpic.cn.attacker.com` 与 `169.254.169.254` 一律拒） |
+| `WechatApiContractTest` | 每个微信接口的路径、鉴权参数放哪、请求体字段名与类型（`auditid` 必须是 number，不是字符串；类目五个接口在 `/cgi-bin/wxopen/` 下而不是 `/wxa/`）；图片抓取主机白名单（放行 `*.qpic.cn`/`*.qlogo.cn`/`*.weixin.qq.com`/桩主机，CDN 的 http 改写成 https，`mmbiz.qpic.cn.attacker.com` 与 `169.254.169.254` 一律拒） |
 | `WechatClientFactoryTest` | 微信接口域名优先级：库里的 api_base 覆盖 `WECHAT_API_BASE`，留空才回落 |
 | `WeChatCallbackDispatchTest` | 回调分发：ticket/授权/解除授权各落到哪一层，签名不过仍回 success，事件表留档字段 |
 | `ComponentTokenLifecycleTest` | component_access_token 生命周期：无 ticket 的 409、锁竞争、61023 判定 ticket 过期 |
 | `AuthorizerTokenRotationTest` | 令牌链：refresh_token 轮换必须回写、失效只重试一次、61023 判定授权失效 |
 | `ReleaseWorkflowTest` | 发布链路状态机：ext_json 组装、auditid 落库、AUDIT_PASS/GRAY/REVERTED 流转 |
 | `ReleaseIcpStatusTest` | 备案 1024~1031 前置条件按位解码（基本信息/类目/认证），缺项一次性列全 |
-| `MiniProgramSettingMappingTest` | 微信下划线字段 ↔ 界面驼峰字段（域名六类、invalid/noIcp、certicates 拼写）；multipart 出站带 Content-Length 而非 chunked；普通方式注册时改名本地拦下；小程序码代取（落库链接优先、非微信主机零请求直接拒、回传 data URL、非图片/空体/4xx/连接中断四类失败各有可读原因、ticket 过期自动刷新资料换新链接重试）；本地副本（有副本时零微信请求、取回后写库、`refresh=true` 覆盖副本、链接变了或超过 7 天才回源、回源失败退回报副本并带 `staleReason`） |
+| `MiniProgramSettingMappingTest` | 微信下划线字段 ↔ 界面驼峰字段（域名六类、invalid/noIcp、certicates 拼写）；类目树（把 `categories_list.categories` 的扁平表按 `father` 组装成一级 → 二级、跳过 `id=0` 的无名根节点、带上 `sensitive_type` 与资质名称；响应里没有文档那个键时抛错并列出实际字段名）；已设置类目（`first/first_name/second/second_name/audit_status/audit_reason` 逐个映射，`category_limit` → `categoryLimit`）；multipart 出站带 Content-Length 而非 chunked；普通方式注册时改名本地拦下；小程序码代取（落库链接优先、非微信主机零请求直接拒、回传 data URL、非图片/空体/4xx/连接中断四类失败各有可读原因、ticket 过期自动刷新资料换新链接重试）；本地副本（有副本时零微信请求、取回后写库、`refresh=true` 覆盖副本、链接变了或超过 7 天才回源、回源失败退回报副本并带 `staleReason`） |
 | `MiniProgramPrivacySettingTest` | 隐私保护指引请求体（privacy_ver / setting_list / owner_setting） |
 | `PlatformDomainServiceTest` | 第三方平台域名白名单：`;` 拼接的裸主机名、两类接口字段名不同（`wxa_server_domain`/`wxa_jump_h5_domain`）、写后必须再 `get`、端口与空清单本地拦住 |
 | `PlatformConfigSerializationTest` | 密钥不进 toString/日志/响应，PUT 的明文密钥能正常绑定 |
 | `PlatformConfigServiceTest` | 单行配置不自动补默认域名（否则 `WECHAT_API_BASE` 失效）、空串能清掉覆盖项、缺字段保持原值 |
 | `PlatformWebContractTest` | Controller 参数绑定、微信 errcode 与 HTTP 状态的映射、分页信封、平台密钥只回掩码 |
-| `PlatformEndToEndTest` | 从扫码授权到发布/灰度/回退的完整链路（桩微信 + 真库表），含操作日志按 `commit`/`release` 等微信接口名精确检索、撤回与加速审核（含不传 `auditId` 的回落）、小程序码在真 MySQL 上的 `MEDIUMBLOB` 字节往返（`V5` 迁移建表 + 第二次读取零微信请求 + `refresh=true` 才回源） |
+| `PlatformEndToEndTest` | 从扫码授权到发布/灰度/回退的完整链路（桩微信 + 真库表），含操作日志按 `commit`/`release` 等微信接口名精确检索、撤回与加速审核（含不传 `auditId` 的回落）、小程序码在真 MySQL 上的 `MEDIUMBLOB` 字节往返（`V5` 迁移建表 + 第二次读取零微信请求 + `refresh=true` 才回源）、服务类目走完整 HTTP 栈（桩按文档回扁平表 → `GET /all-categories` 仍是组装好的两级树、含 `sensitive_type` 与资质名 → `POST /categories` 发 `{first, second}` 到 `/cgi-bin/wxopen/addcategory`） |
 
 已在本机连真库、连真微信域名验证过（2026-11-17）：登录、凭据保存且只回掩码、安全模式的回调 URL 校验与票据推送
 （含签名不符仍回 `success`、`/wx/callback/{appid}` 代收路径）、健康检查真实请求 `api.weixin.qq.com`
@@ -518,6 +537,29 @@ E2E 的 `MockWeChatServer` 把该响应自造成为 `{grayinfo:{...}}`、并把 
 仍然没被证明的：服务端带着放行后的白名单去请求**真实** `mmbiz.qpic.cn` 直链能否取回原图（要部署后那一次真实请求，
 `docker compose logs api | grep 业务异常`），以及首次部署时 `V5` 迁移在既有库上跑不跑得干净。
 
+类目这一轮（2026-11-20）的直接现象是界面上那句「未从 `GET /api/authorizers/{appid}/all-categories` 解析出类目树，请确认后端返回结构与文档一致」，
+但提示本身没有指向真因：`getallcategories` 文档给的是靠 `father` 关联的**扁平表**（`categories_list.categories`，`id=0` 是无名根节点），
+而前端的解析器只认自己猜的 `sub_categories/children/sub/list/items/secondList/categories` 七个键，后端又是纯透传——
+于是「前端假设的形状」悄悄成了事实上的接口规范，`MockWeChatServer` 与本机桩各自照这个假设造了 `category_list`，
+213 条绿灯里没有任何一条会去质疑这个形状。本轮把它按文档改回来：树由后端 `allCategories` 组装（按 `father` 归位，将来微信给三级也照样长出来），
+前端只消费有类型的 `CategoryTreeNode[]`，`CategoryTab` 与提审面板的类目选择共用同一份；
+文档键缺席时 `BizException` 直接列出实际收到的字段名（界面顶部的告警原样显示），不再回空数组让级联框静默空白。
+`getcategory` 同样按文档改成扁平（`first/first_name/second/second_name/audit_status/audit_reason`）——
+此前按 `{first:{id,name}}` 对象读，左列表每一行都渲染成「未命名类目」、删除按钮恒提示「该类目缺少一二级 ID」，
+现在改为显示「一级 / 二级」与「审核中 / 审核不通过 + 微信给的中文原因 / 审核通过」。
+顺带核掉一处口头约定：五份类目文档标注的权限集都是 `30`，`17` 在任何缓存文档里都找不到出处，已从「扫码授权」页的权限集选项里删掉。
+后端 213 例全绿（原 210 + 本轮 3，都在 `MiniProgramSettingMappingTest`：文档扁平表组装成两级树、非法形状抛错点名字段、已设置类目逐字段映射），
+E2E 仍是 18 例但断言全部换到文档形状上；前端 `vue-tsc` + `npm run build` 通过。
+浏览器实测（桩后端，证据取自 `uistub-access.log` / `uistub-payloads.log`）：级联框能逐级展开并选中，
+新增敏感类目「社会组织 / 律师」时发出的就是 `{"first":201,"second":203}`，同时面板列出所需资质《律师执业资格证》并写明直接提交微信回 `53311`；
+提审面板一条 `item_list` 是 `{"address":"pages/index/index","firstClass":"社会组织","firstId":201,"secondClass":"协会/商会","secondId":202}`，
+未选三级时不会出现 `third` 相关键；把桩切成 `{"errcode":0,"category_list":[]}` 时告警整行显示「…实际收到的字段是 errcode、errmsg、category_list，无法组装可选类目树」，
+切成空数组时显示的才是「微信没有下发这个主体的可选类目…（接口归属权限集 id 30）」而不是「解析失败」。
+删除类目这条只由测试与契约核实（`?first=&second=` 走 query、到微信侧才是 `{first, second}` body），浏览器里没有真点删除按钮。
+`el-cascader` 设了 `expandTrigger:'hover'`，点父节点不展开——`click` 在这层守不住任何东西，
+要用 `evaluate_script` 派发 `pointerenter`/`mouseenter`/`mouseover` 才出现第二级菜单，这类「操作发不发请求」的结论一律以日志为准。
+仍未被证明的：真实主体下微信实际下发哪些一级/二级类目（与主体类型、认证范围强相关），以及资质材料上传这条还缺失的链路。
+
 仍只能等真实凭据与备案域名才能验证：真实 `component_appid`/`component_secret` 换取 token、出口 IP 白名单（缺失报 `40164`）、
 公网 https 备案域名的微信侧校验、已备案小程序才允许发布、宿主机 nginx 的证书链与 `/wx/` 透传（compose 已不含 caddy）。
 第三方平台的加急额度余量也没有可查接口，用超了只能等微信返回错误码。
@@ -546,7 +588,10 @@ E2E 的 `MockWeChatServer` 把该响应自造成为 `{grayinfo:{...}}`、并把 
    连接不通＝出口网络或 IP 白名单、`不是图片`＝回来的是错误页而不是二维码。
 4. **上传代码 → 体验版**：选模板提交代码包，然后点步骤二的「刷新二维码」拿到真实体验版二维码，扫码进体验版；
    再把 `GET /wxa/get_page` 的清单与模板实际页面对一遍——提审面板的候选就来自这里，清单为空说明这次 commit 没成功。
-5. **提审 → 审核 → 发布**：提交审核后界面每 30 秒自动查一次；`status=4`（审核延后）会留在「审核中」继续轮询，不要当驳回处理。
+5. **提审 → 审核 → 发布**：提审前先在「配置 → 类目与域名」读一次可选类目——真实主体下这份清单由微信按主体类型与认证范围下发，
+   读到树说明权限集 `30` 已授到且形状与文档一致；空列表是「该主体微信没下发可选类目」（去小程序后台确认认证范围），
+   而不是解析失败。带资质的敏感类目这一步站内还提交不了（没有资质上传入口），需先在小程序后台「设置 → 基本设置 → 服务类目」办好。
+   提交审核后界面每 30 秒自动查一次；`status=4`（审核延后）会留在「审核中」继续轮询，不要当驳回处理。
    过审后点发布，若报未备案相关错误，先看「备案状态」面板的解码结果，缺哪一项补哪一项。
 6. **灰度与回退**：灰度发布后「发布 / 灰度」面板应回显「执行中 · N%」（比例只来自 `getgrayreleaseplan`，微信的 `grayrelease` 响应里没有它）；
    结束灰度后回到「执行完毕 · 100%」。若商家直接在小程序后台收尾，本地 `GRAY` 会在下一次读计划时被纠正成已上线，界面会写明原因。

@@ -3,9 +3,9 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Delete, DocumentCopy, Plus, Promotion, Refresh } from '@element-plus/icons-vue'
 
-import { listAllCategories } from '@/api/config'
+import { listAllCategories, type CategoryTreeNode } from '@/api/config'
 import { listPages, submitAudit, type AuditKeywordItem, type AuditSubmitItem } from '@/api/release'
-import { normalizeCategoryTree, resolveCategoryRefs, toCascaderOptions, type CategoryNode } from '@/utils/category'
+import { resolveCategoryRefs, toCascaderOptions } from '@/utils/category'
 import { describeError } from '@/utils/request'
 
 const props = defineProps<{ appid: string }>()
@@ -26,7 +26,7 @@ const submitting = ref(false)
 const errorText = ref('')
 const auditId = ref('')
 const treeLoading = ref(false)
-const tree = ref<CategoryNode[]>([])
+const tree = ref<CategoryTreeNode[]>([])
 let rowKey = 0
 
 const feedbackInfo = ref('')
@@ -151,7 +151,7 @@ async function loadTree(): Promise<void> {
   if (!props.appid) return
   treeLoading.value = true
   try {
-    tree.value = normalizeCategoryTree(await listAllCategories(props.appid))
+    tree.value = (await listAllCategories(props.appid)) ?? []
   } catch {
     tree.value = []
   } finally {

@@ -391,14 +391,14 @@ class MiniProgramSettingMappingTest {
     void addCategoryKeepsWechatSpelling() throws Exception {
         ok("{\"errcode\":0,\"errmsg\":\"ok\"}");
 
-        service.addCategory(APPID, 109, 19, null,
-                List.of(Map.of("material_type", 1, "media_id", "MEDIA_LICENCE")));
+        service.addCategory(APPID, 8, 39, null,
+                List.of(Map.of("key", "《因私出入境中介机构经营许可证》", "value", "MOCK_MEDIA_ID")));
 
         JsonNode category = requestBody().path("categories").get(0);
-        assertThat(category.path("first").asInt()).isEqualTo(109);
-        assertThat(category.path("second").asInt()).isEqualTo(19);
+        assertThat(category.path("first").asInt()).isEqualTo(8);
+        assertThat(category.path("second").asInt()).isEqualTo(39);
         assertThat(category.has("third")).isFalse();
-        assertThat(category.path("certicates").get(0).path("media_id").asText()).isEqualTo("MEDIA_LICENCE");
+        assertThat(category.path("certicates").get(0).path("value").asText()).isEqualTo("MOCK_MEDIA_ID");
         assertThat(category.has("certificates")).isFalse();
     }
 
@@ -410,6 +410,74 @@ class MiniProgramSettingMappingTest {
                 .hasMessageContaining("一级与二级编号必填");
 
         assertThat(server.getRequestCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("可选类目：微信的扁平表按 father 组装成树，根节点 id=0 不进结果")
+    void allCategoriesBuildsTreeFromFlatTable() throws Exception {
+        ok("""
+                {"errcode":0,"errmsg":"ok","categories_list":{"categories":[
+                  {"id":0,"children":[1,8],"qualify":{"exter_list":[],"remark":""}},
+                  {"id":1,"name":"快递业与邮政","level":1,"father":0,"children":[2,5],"sensitive_type":0},
+                  {"id":2,"name":"快递收派","level":2,"father":1,"children":[],"sensitive_type":0},
+                  {"id":5,"name":"邮政","level":2,"father":1,"children":[],"sensitive_type":0},
+                  {"id":8,"name":"教育","level":1,"father":0,"children":[39],"sensitive_type":0},
+                  {"id":39,"name":"出国移民","level":2,"father":8,"children":[],"sensitive_type":1,
+                   "qualify":{"exter_list":[{"inner_list":[
+                     {"name":"《因私出入境中介机构经营许可证》","url":""}]}]}}
+                ]}}
+                """);
+
+        List<Map<String, Object>> tree = service.allCategories(APPID);
+
+        assertThat(take().getPath()).startsWith("/cgi-bin/wxopen/getallcategories");
+        assertThat(tree).hasSize(2);
+        assertThat(tree.get(0).get("name")).isEqualTo("快递业与邮政");
+        assertThat(childrenOf(tree.get(0)).get(1).get("name")).isEqualTo("邮政");
+
+        Map<String, Object> sensitive = childrenOf(tree.get(1)).get(0);
+        assertThat(sensitive.get("sensitiveType")).isEqualTo(1);
+        assertThat(sensitive.get("qualifyNames")).isEqualTo(List.of("《因私出入境中介机构经营许可证》"));
+    }
+
+    @Test
+    @DisplayName("可选类目：微信没按文档给 categories_list.categories 时要报错，不能留一个空的级联选择器")
+    void allCategoriesRejectsUndocumentedShape() {
+        ok("{\"errcode\":0,\"errmsg\":\"ok\",\"category_list\":[]}");
+
+        assertThatThrownBy(() -> service.allCategories(APPID))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("categories_list.categories")
+                .hasMessageContaining("category_list");
+    }
+
+    @Test
+    @DisplayName("已设置类目：微信给 first/first_name/audit_status，界面读 firstId/firstName/auditStatus")
+    void categoriesMapDocumentedFlatFields() throws Exception {
+        ok("{\"errcode\":0,\"errmsg\":\"ok\",\"categories\":[{\"first\":8,\"first_name\":\"教育\","
+                + "\"second\":39,\"second_name\":\"出国移民\",\"audit_status\":2,"
+                + "\"audit_reason\":\"主体经营范围与所选类目描述不一致\"}],"
+                + "\"limit\":5,\"quota\":4,\"category_limit\":20}");
+
+        Map<String, Object> result = service.categories(APPID);
+
+        assertThat(take().getPath()).startsWith("/cgi-bin/wxopen/getcategory");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> rows = (List<Map<String, Object>>) result.get("categories");
+        assertThat(rows).hasSize(1);
+        assertThat(rows.get(0))
+                .containsEntry("firstId", 8)
+                .containsEntry("firstName", "教育")
+                .containsEntry("secondName", "出国移民")
+                .containsEntry("auditStatus", 2)
+                .containsEntry("auditReason", "主体经营范围与所选类目描述不一致");
+        assertThat(result.get("categoryLimit")).isEqualTo(20);
+        assertThat(result.get("quota")).isEqualTo(4);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> childrenOf(Map<String, Object> node) {
+        return (List<Map<String, Object>>) node.get("children");
     }
 
     @Test
