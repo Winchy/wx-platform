@@ -15,6 +15,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -111,7 +112,29 @@ public class AuthorizerWriter {
 
     private void upsertRefreshToken(PlatformConfig config, String appid, String refreshToken, String funcInfoJson) {
         Authorizer existing = find(appid);
-        Authorizer entity = existing == null ? new Authorizer() : existing;
+        if (existing == null) {
+            Authorizer entity = new Authorizer();
+            applyRefreshToken(entity, config, appid, refreshToken, funcInfoJson);
+            try {
+                authorizerMapper.insert(entity);
+                return;
+            } catch (DuplicateKeyException ex) {
+                // 微信在扫码授权后会同时推 authorized 事件、又跳转浏览器回调，两条链路并发对同一个
+                // appid 做「查不到就插入」，唯一索引只放过一条。落后的那条必须转成更新：并发事务
+                // 刚提交的行在本事务的快照读里看不到，得用 FOR UPDATE 走当前读。
+                existing = findForUpdate(appid);
+                if (existing == null) {
+                    throw ex;
+                }
+                log.info("授权写入撞上唯一索引，改为更新已有记录 appid={}", appid);
+            }
+        }
+        applyRefreshToken(existing, config, appid, refreshToken, funcInfoJson);
+        authorizerMapper.updateById(existing);
+    }
+
+    private void applyRefreshToken(Authorizer entity, PlatformConfig config, String appid,
+                                   String refreshToken, String funcInfoJson) {
         entity.setComponentAppid(config.getComponentAppid());
         entity.setAuthorizerAppid(appid);
         entity.setRefreshTokenEnc(cipher.encrypt(refreshToken));
@@ -121,11 +144,6 @@ public class AuthorizerWriter {
         }
         if (entity.getAuthorizedAt() == null) {
             entity.setAuthorizedAt(LocalDateTime.now());
-        }
-        if (existing == null) {
-            authorizerMapper.insert(entity);
-        } else {
-            authorizerMapper.updateById(entity);
         }
     }
 
@@ -182,6 +200,13 @@ public class AuthorizerWriter {
     public Authorizer find(String appid) {
         return authorizerMapper.selectOne(new LambdaQueryWrapper<Authorizer>()
                 .eq(Authorizer::getAuthorizerAppid, appid));
+    }
+
+    /** 当前读并锁行：只在并发写入撞唯一索引后用一次，普通读取别走这里。 */
+    private Authorizer findForUpdate(String appid) {
+        return authorizerMapper.selectOne(new LambdaQueryWrapper<Authorizer>()
+                .eq(Authorizer::getAuthorizerAppid, appid)
+                .last("FOR UPDATE"));
     }
 
     public Authorizer require(String appid) {

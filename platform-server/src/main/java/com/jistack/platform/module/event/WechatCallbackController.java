@@ -1,5 +1,7 @@
 package com.jistack.platform.module.event;
 
+import com.jistack.platform.common.web.BizException;
+import com.jistack.platform.wechat.client.WechatApiException;
 import com.jistack.platform.wechat.service.AuthorizationService;
 import com.jistack.platform.wechat.service.WeChatCallbackService;
 import lombok.RequiredArgsConstructor;
@@ -65,15 +67,40 @@ public class WechatCallbackController {
                                              @RequestParam(value = "state", required = false) String state) {
         try {
             String appid = authorizationService.confirmByAuthCode(authCode, state);
-            return redirectTo("/authorizers?auth=success&appid=" + appid);
+            return redirectTo("/authorizers", "success", "appid", appid);
         } catch (Exception ex) {
             log.warn("授权回调处理失败: {}", ex.toString());
-            return redirectTo("/authorizers?auth=failed&message=" + ex.getMessage());
+            return redirectTo("/authorizers", "failed", "message", briefReason(ex));
         }
     }
 
-    private ResponseEntity<Void> redirectTo(String path) {
-        java.net.URI uri = UriComponentsBuilder.fromPath(path).build().toUri();
+    /**
+     * 跳转地址必须用 queryParam 单独拼：{@code fromPath("/a?b=c")} 会把 {@code ?} 当成路径的一部分
+     * 编码成 {@code %3F}，前端路由匹配不到，用户看到的是 404 而不是结果。
+     */
+    private ResponseEntity<Void> redirectTo(String path, String auth, String paramName, String paramValue) {
+        java.net.URI uri = UriComponentsBuilder.fromPath(path)
+                .queryParam("auth", auth)
+                .queryParam(paramName, paramValue)
+                .build()
+                .encode()
+                .toUri();
         return ResponseEntity.status(302).location(uri).build();
+    }
+
+    /** 地址栏里只放人能看懂的原因；SQL、堆栈这类内部细节留在服务端日志。 */
+    private String briefReason(Exception ex) {
+        String reason;
+        if (ex instanceof BizException biz) {
+            reason = biz.getMessage();
+        } else if (ex instanceof WechatApiException wechat) {
+            reason = "微信接口错误 [" + wechat.getErrcode() + "] " + wechat.getErrmsg();
+        } else {
+            reason = "授权处理失败，请查看服务端日志";
+        }
+        if (reason == null) {
+            return "授权处理失败，请查看服务端日志";
+        }
+        return reason.length() <= 160 ? reason : reason.substring(0, 160);
     }
 }

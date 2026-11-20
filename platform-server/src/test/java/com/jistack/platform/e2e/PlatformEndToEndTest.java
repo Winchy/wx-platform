@@ -2,6 +2,10 @@ package com.jistack.platform.e2e;
 
 import com.jistack.platform.wechat.crypto.WeChatMsgCrypt;
 import com.jistack.platform.wechat.crypto.XmlCodec;
+import com.jistack.platform.module.authorizer.Authorizer;
+import com.jistack.platform.module.authorizer.AuthorizerMapper;
+import com.jistack.platform.wechat.service.AuthorizationService;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import okhttp3.mockwebserver.MockWebServer;
@@ -39,6 +43,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
@@ -128,6 +137,10 @@ class PlatformEndToEndTest {
     private ObjectMapper json;
     @Autowired
     private StringRedisTemplate redis;
+    @Autowired
+    private AuthorizationService authorizationService;
+    @Autowired
+    private AuthorizerMapper authorizerMapper;
 
     private String token;
 
@@ -356,10 +369,23 @@ class PlatformEndToEndTest {
                         .param("auth_code", "MOCK_AUTH_CODE_E2E")
                         .param("state", state))
                 .andExpect(status().is3xxRedirection())
-                .andExpect(header().string(HttpHeaders.LOCATION, Matchers.containsString("auth=success")));
+                // 只断言子串会漏掉「? 被编码成 %3F」这一类缺陷：整串里 auth=success 依然在，
+                // 但前端路由匹配不到路径，用户看到的是 404。这里锚定路径并显式排除编码后的问号。
+                .andExpect(header().string(HttpHeaders.LOCATION,
+                        Matchers.startsWith("/authorizers?auth=success&appid=" + AUTHORIZER_APPID)))
+                .andExpect(header().string(HttpHeaders.LOCATION, Matchers.not(Matchers.containsString("%3F"))));
 
         JsonNode confirmed = api(HttpMethod.GET, "/api/authorizers/auth-sessions/" + state, null);
         assertThat(confirmed.path("status").asText()).isEqualTo("CONFIRMED");
+
+        // 失败分支：中文原因必须被百分号编码，且不能把 SQL/堆栈带进地址栏
+        mvc.perform(MockMvcRequestBuilders.get("/wx/auth/callback"))
+                .andExpect(status().is3xxRedirection())
+                .andExpect(header().string(HttpHeaders.LOCATION, Matchers.containsString("auth=failed")))
+                .andExpect(header().string(HttpHeaders.LOCATION, Matchers.containsString("message=%E7%BC%BA")))
+                .andExpect(header().string(HttpHeaders.LOCATION, Matchers.not(Matchers.containsString("%3F"))))
+                .andExpect(header().string(HttpHeaders.LOCATION,
+                        Matchers.not(Matchers.containsStringIgnoringCase("select "))));
         assertThat(confirmed.path("resultAppid").asText()).isEqualTo(AUTHORIZER_APPID);
         assertThat(WX_DISPATCHER.called("/cgi-bin/component/api_query_auth")).isTrue();
 
@@ -372,6 +398,39 @@ class PlatformEndToEndTest {
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value(404));
+    }
+
+    @Test
+    @DisplayName("authorized 事件与浏览器回调并发落库：唯一索引不再让授权失败")
+    void concurrentAuthorizationWritesConverge() throws Exception {
+        // 扫码授权成功后微信会同时做两件事：向事件接收 URL 推 authorized 事件、把浏览器跳到
+        // /wx/auth/callback。两条链路对同一个 appid 同时「查不到就插入」，落后的一方原本会抛
+        // Duplicate entry 'wx...' for key 'uk_authorizer_appid'，并把整段 SQL 带回地址栏。
+        for (int round = 0; round < 6; round++) {
+            final int current = round;
+            authorizerMapper.delete(new LambdaQueryWrapper<Authorizer>()
+                    .eq(Authorizer::getAuthorizerAppid, AUTHORIZER_APPID));
+
+            CyclicBarrier barrier = new CyclicBarrier(2);
+            ExecutorService pool = Executors.newFixedThreadPool(2);
+            try {
+                Future<String> eventPush = pool.submit(() -> {
+                    barrier.await();
+                    return authorizationService.confirmByAuthCode("RACE_" + current + "_A", null);
+                });
+                Future<String> browserRedirect = pool.submit(() -> {
+                    barrier.await();
+                    return authorizationService.confirmByAuthCode("RACE_" + current + "_B", null);
+                });
+                assertThat(eventPush.get(30, TimeUnit.SECONDS)).isEqualTo(AUTHORIZER_APPID);
+                assertThat(browserRedirect.get(30, TimeUnit.SECONDS)).isEqualTo(AUTHORIZER_APPID);
+            } finally {
+                pool.shutdownNow();
+            }
+
+            assertThat(authorizerMapper.selectCount(new LambdaQueryWrapper<Authorizer>()
+                    .eq(Authorizer::getAuthorizerAppid, AUTHORIZER_APPID))).isEqualTo(1L);
+        }
     }
 
     @Test

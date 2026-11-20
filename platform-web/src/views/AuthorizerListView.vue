@@ -4,7 +4,7 @@ export default { name: 'AuthorizerListView' }
 
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Promotion, Refresh, Search, User } from '@element-plus/icons-vue'
 
@@ -21,6 +21,7 @@ import { authStateOptions } from '@/utils/status'
 import { describeError } from '@/utils/request'
 
 const router = useRouter()
+const route = useRoute()
 
 const loading = ref(false)
 const rows = ref<AuthorizerItem[]>([])
@@ -121,7 +122,29 @@ async function onRevoke(row: AuthorizerItem): Promise<void> {
   }
 }
 
-onMounted(load)
+/** 微信授权回跳的结果只带在查询参数里，弹一次就清掉，免得刷新页面重复提示。 */
+function reportAuthResult(): void {
+  const auth = queryText(route.query.auth)
+  if (!auth) {
+    return
+  }
+  if (auth === 'success') {
+    const appid = queryText(route.query.appid)
+    ElMessage.success(appid ? `授权完成，已接入 ${appid}` : '授权完成')
+  } else {
+    ElMessage.error(queryText(route.query.message) || '授权失败，请查看服务端日志')
+  }
+  void router.replace({ path: '/authorizers' })
+}
+
+function queryText(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
+onMounted(() => {
+  reportAuthResult()
+  void load()
+})
 </script>
 
 <template>
