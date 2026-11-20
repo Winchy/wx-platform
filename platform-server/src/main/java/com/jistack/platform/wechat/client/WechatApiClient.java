@@ -3,6 +3,7 @@ package com.jistack.platform.wechat.client;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.jistack.platform.common.web.BizException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -31,11 +32,21 @@ public class WechatApiClient {
     public static final List<Integer> RETRYABLE_TOKEN_ERRORS = List.of(40001, 42001, 40013, 61005, 61023, 61024, 61035);
 
     private final String apiBase;
+    private final String apiHost;
+    private final String apiScheme;
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
 
     public WechatApiClient(String apiBase, RestTemplate restTemplate, ObjectMapper objectMapper) {
         this.apiBase = apiBase == null ? "https://api.weixin.qq.com" : apiBase.replaceAll("/+$", "");
+        URI base;
+        try {
+            base = URI.create(this.apiBase);
+        } catch (IllegalArgumentException ex) {
+            base = null;
+        }
+        this.apiHost = base == null || base.getHost() == null ? "" : base.getHost();
+        this.apiScheme = base == null || base.getScheme() == null ? "https" : base.getScheme();
         this.restTemplate = restTemplate;
         this.objectMapper = objectMapper;
     }
@@ -182,6 +193,38 @@ public class WechatApiClient {
     /** 二维码等二进制响应：微信出错时会返回 JSON，需要按 Content-Type 区分。 */
     public byte[] getBinary(String path, Map<String, String> query) {
         return binary(path, url(path, query), HttpMethod.GET, null);
+    }
+
+    /**
+     * 抓取微信的图片直链（如 authorizer_info.qrcode_url 指向的 showqrcode）：绝对地址、不带令牌。
+     * 这类链接有 Referer 防盗链，浏览器带本站来源直连只会拿到「未经允许不可引用」的占位图，只能由服务端取。
+     */
+    public byte[] getBinaryAbsolute(String url) {
+        URI uri = imageUri(url);
+        return binary(uri.getPath(), uri.toString(), HttpMethod.GET, null);
+    }
+
+    /** 链接只来自微信响应，但落库后仍可能被改写，所以限定主机与协议，别让它变成任意 URL 抓取。 */
+    private URI imageUri(String value) {
+        URI uri;
+        try {
+            uri = URI.create(value == null ? "" : value.trim());
+        } catch (IllegalArgumentException ex) {
+            throw new BizException("图片链接格式不合法，无法抓取");
+        }
+        String host = uri.getHost() == null ? "" : uri.getHost();
+        boolean weixinHost = host.equalsIgnoreCase("weixin.qq.com")
+                || host.toLowerCase(java.util.Locale.ROOT).endsWith(".weixin.qq.com");
+        if (!weixinHost && !host.equalsIgnoreCase(apiHost)) {
+            throw new BizException("图片链接的域名不是微信站点，已拒绝抓取：" + host);
+        }
+        String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(java.util.Locale.ROOT);
+        String expected = weixinHost ? "https" : apiScheme;
+        if (!expected.equals(scheme)) {
+            throw new BizException("图片链接应为 " + expected + " 协议，当前是"
+                    + (scheme.isEmpty() ? "未指定协议" : " " + scheme));
+        }
+        return uri;
     }
 
     /** 永久素材（如审核驳回截图）用 POST 取回，图片类型直接回二进制字节。 */

@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, type FormInstance, type FormRules, type UploadRequestHandler } from 'element-plus'
-import { Check, CircleCheck, Delete, Edit, Picture, Plus, Upload } from '@element-plus/icons-vue'
+import { Check, CircleCheck, Delete, Edit, Link, Picture, Plus, Refresh, Upload } from '@element-plus/icons-vue'
 
 import {
   checkNickname,
+  getAuthorizerQrcode,
   getBasicInfo,
   updateAvatar,
   updateNickname,
   updateSignature,
   uploadNicknameMaterial,
+  type AuthorizerQrcode,
   type BasicInfo,
   type NicknameCheckResult
 } from '@/api/config'
@@ -22,6 +24,10 @@ const props = defineProps<{ appid: string }>()
 const loading = ref(false)
 const loadError = ref('')
 const info = ref<BasicInfo | null>(null)
+
+const qrcode = ref<AuthorizerQrcode | null>(null)
+const qrcodeLoading = ref(false)
+const qrcodeError = ref('')
 
 const nicknameDialog = ref(false)
 const signatureDialog = ref(false)
@@ -103,6 +109,24 @@ async function load(): Promise<void> {
     loadError.value = describeError(error)
   } finally {
     loading.value = false
+  }
+  await loadQrcode()
+}
+
+/** 小程序码由后端代取：微信的 showqrcode 直链有 Referer 防盗链，浏览器直连只会拿到「未经允许不可引用」的占位图。 */
+async function loadQrcode(): Promise<void> {
+  qrcode.value = null
+  qrcodeError.value = ''
+  if (!props.appid || !info.value?.qrCodeUrl) {
+    return
+  }
+  qrcodeLoading.value = true
+  try {
+    qrcode.value = await getAuthorizerQrcode(props.appid)
+  } catch (error) {
+    qrcodeError.value = describeError(error)
+  } finally {
+    qrcodeLoading.value = false
   }
 }
 
@@ -292,20 +316,26 @@ defineExpose({ reload: load })
           </div>
         </div>
 
-        <div class="basic-info__qrcode">
-          <el-image v-if="info.qrCodeUrl" :src="info.qrCodeUrl" fit="contain" class="basic-info__qrcode-img">
-            <template #error>
-              <div class="basic-info__qrcode-error">
-                <el-icon><Picture /></el-icon>
-                <span>小程序码加载失败</span>
-              </div>
-            </template>
-          </el-image>
+        <div v-loading="qrcodeLoading" class="basic-info__qrcode">
+          <el-image
+            v-if="qrcode"
+            :src="qrcode.dataUrl"
+            :preview-src-list="[qrcode.dataUrl]"
+            :initial-index="0"
+            preview-teleported
+            fit="contain"
+            alt="小程序码"
+            class="basic-info__qrcode-img"
+          />
           <div v-else class="basic-info__qrcode-error">
             <el-icon><Picture /></el-icon>
-            <span>后端未返回小程序码</span>
+            <span>{{ qrcodeError ? '小程序码取图失败' : '暂无小程序码' }}</span>
           </div>
-          <el-button v-if="info.qrCodeUrl" text size="small" @click="copyQrCodeUrl">复制图片链接</el-button>
+          <div v-if="info.qrCodeUrl" class="basic-info__qrcode-actions">
+            <el-button text size="small" :loading="qrcodeLoading" :icon="Refresh" @click="loadQrcode()">重新取图</el-button>
+            <el-button text size="small" :icon="Link" @click="copyQrCodeUrl">复制图片链接</el-button>
+          </div>
+          <p v-if="qrcodeError" class="muted basic-info__qrcode-reason">{{ qrcodeError }}</p>
         </div>
       </div>
 
@@ -331,6 +361,11 @@ defineExpose({ reload: load })
           <li>
             头像分两步：先把图片传成「新增临时素材」换 <span class="mono">media_id</span>，再带裁剪框提交；
             别的途径拿到的素材 id 微信不认（40007）。图片 2M 以内，一年可申请修改 5 次。
+          </li>
+          <li>
+            小程序码由后端代取再显示：微信对 <span class="mono">showqrcode</span> 直链做了 Referer 防盗链，
+            网页里直接引用只会拿到「此图片来自微信公众平台 未经允许不可引用」的占位图。
+            「复制图片链接」给出的仍是微信原始直链，粘贴到浏览器地址栏能直接打开。
           </li>
         </ul>
       </div>
@@ -548,6 +583,20 @@ defineExpose({ reload: load })
   border-radius: 8px;
   color: var(--app-text-muted);
   font-size: 12px;
+}
+
+.basic-info__qrcode-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.basic-info__qrcode-reason {
+  max-width: 230px;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
 }
 
 .panel--inner {

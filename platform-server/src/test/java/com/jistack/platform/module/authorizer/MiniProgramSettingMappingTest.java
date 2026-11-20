@@ -52,6 +52,8 @@ class MiniProgramSettingMappingTest {
             WechatCaller.AuthCall call = invocation.getArgument(2, WechatCaller.AuthCall.class);
             return call.apply(api, TOKEN);
         });
+        // 小程序码代取走 caller.api()，不经令牌链
+        when(caller.api()).thenReturn(api);
         writer = mock(AuthorizerWriter.class);
         when(writer.require(anyString())).thenReturn(new Authorizer());
         service = new MiniProgramSettingService(caller, writer);
@@ -84,6 +86,19 @@ class MiniProgramSettingMappingTest {
         System.arraycopy(head, 0, all, 0, head.length);
         System.arraycopy(body, 0, all, head.length, body.length);
         return all;
+    }
+
+    /** 小程序码直链落在 wechat_authorizer.qrcode_url 上，这里指到本机桩，主机与 apiBase 一致才允许抓。 */
+    private Authorizer withQrcodeLink(String path) {
+        Authorizer authorizer = new Authorizer();
+        authorizer.setQrcodeUrl(server.url(path).toString());
+        when(writer.require(anyString())).thenReturn(authorizer);
+        return authorizer;
+    }
+
+    private void imageResponse(byte[] bytes, String contentType) {
+        server.enqueue(new MockResponse().addHeader("Content-Type", contentType)
+                .setBody(new okio.Buffer().write(bytes)));
     }
 
     @Test
@@ -580,5 +595,85 @@ class MiniProgramSettingMappingTest {
         assertThatThrownBy(() -> service.uploadNicknameMaterial(APPID, "a.png", new byte[]{1}))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("media_id");
+    }
+
+    @Test
+    @DisplayName("小程序码：优先用落库的 qrcode_url，取回的是 data URL 且不带 Referer")
+    void qrcodeUsesStoredLink() throws Exception {
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=gQG88Do");
+        imageResponse(pngBytes(), "image/png");
+
+        Map<String, Object> result = service.qrcodeImage(APPID);
+
+        RecordedRequest request = take();
+        assertThat(request.getMethod()).isEqualTo("GET");
+        assertThat(request.getPath()).isEqualTo("/cgi-bin/showqrcode?ticket=gQG88Do");
+        // 微信的防盗链看 Referer：服务端这一趟不该带，带了就拿回「未经允许不可引用」占位图
+        assertThat(request.getHeader("Referer")).isNull();
+        assertThat(result.get("contentType")).isEqualTo("image/png");
+        String dataUrl = (String) result.get("dataUrl");
+        assertThat(dataUrl).startsWith("data:image/png;base64,");
+        assertThat(java.util.Base64.getDecoder()
+                .decode(dataUrl.substring("data:image/png;base64,".length()))).isEqualTo(pngBytes());
+    }
+
+    @Test
+    @DisplayName("小程序码：库里没有链接时退回 getaccountbasicinfo 的老字段")
+    void qrcodeFallsBackToAccountInfo() throws Exception {
+        ok("{\"errcode\":0,\"qr_code_url\":\"" + server.url("/cgi-bin/showqrcode?ticket=OLD") + "\"}");
+        imageResponse(pngBytes(), "image/png");
+
+        assertThat(service.qrcodeImage(APPID).get("url")).asString().endsWith("/cgi-bin/showqrcode?ticket=OLD");
+
+        assertThat(take().getPath()).startsWith("/cgi-bin/account/getaccountbasicinfo");
+        assertThat(take().getPath()).isEqualTo("/cgi-bin/showqrcode?ticket=OLD");
+    }
+
+    @Test
+    @DisplayName("小程序码：链接指向非微信域名时拒绝抓取，一个请求都不发")
+    void qrcodeRejectsForeignHost() {
+        Authorizer authorizer = new Authorizer();
+        authorizer.setQrcodeUrl("http://169.254.169.254/latest/meta-data/");
+        when(writer.require(anyString())).thenReturn(authorizer);
+
+        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("不是微信站点");
+        assertThat(server.getRequestCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("小程序码：微信域名的链接必须是 https，不受 apiBase 协议影响")
+    void qrcodeRequiresHttpsForWeixinHost() {
+        Authorizer authorizer = new Authorizer();
+        authorizer.setQrcodeUrl("http://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=X");
+        when(writer.require(anyString())).thenReturn(authorizer);
+
+        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("https");
+        assertThat(server.getRequestCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("小程序码：微信两处都没给链接时提示先刷新授权资料")
+    void qrcodeWithoutAnyLink() {
+        ok("{\"errcode\":0,\"nickname\":\"某某协会服务\"}");
+
+        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("刷新资料");
+    }
+
+    @Test
+    @DisplayName("小程序码：取回的不是图片就点名，别把错误页当二维码显示")
+    void qrcodeRejectsNonImage() {
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=EXPIRED");
+        server.enqueue(new MockResponse().addHeader("Content-Type", "text/html")
+                .setBody("<html>ticket invalid</html>"));
+
+        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("不是图片");
     }
 }

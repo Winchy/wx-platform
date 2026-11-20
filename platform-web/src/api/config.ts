@@ -29,6 +29,14 @@ export interface NicknameCheckResult {
   wording: string
 }
 
+/** 小程序码：dataUrl 供界面显示，url 是微信原始的 showqrcode 直链（复制用，直接打开能看到图，嵌进网页会被防盗链拦下） */
+export interface AuthorizerQrcode {
+  url: string
+  contentType: string
+  size: number
+  dataUrl: string
+}
+
 /** 材料都是「新增临时素材」换来的 media_id：个人主体填 idCard，组织主体（协会/企业）填 license */
 export interface NicknameUpdateParams {
   nickname: string
@@ -156,6 +164,11 @@ export interface TesterUnbindParams {
 
 export function getBasicInfo(appid: string): Promise<BasicInfo> {
   return get<BasicInfo>(`/authorizers/${appid}/basic-info`)
+}
+
+/** 小程序码取图：后端代取，绕开微信对 showqrcode 的 Referer 防盗链 */
+export function getAuthorizerQrcode(appid: string): Promise<AuthorizerQrcode> {
+  return get<AuthorizerQrcode>(`/authorizers/${appid}/qrcode`, undefined, SILENT)
 }
 
 /** 改名前先检测名称是否命中关键词 */

@@ -72,8 +72,7 @@ public class MiniProgramSettingService {
                 firstNonEmpty(headImageInfo.path("head_image_url"), account.path("head_image_url"),
                         account.path("head_img")),
                 authorizer.getHeadImg()));
-        result.put("qrCodeUrl", orText(firstNonEmpty(account.path("qr_code_url"), account.path("qrcode_url")),
-                authorizer.getQrcodeUrl()));
+        result.put("qrCodeUrl", qrcodeUrlOf(account, authorizer));
         result.put("userName", orText(account.path("user_name").asText(null), authorizer.getOriginalUsername()));
         result.put("principalName", orText(account.path("principal_name").asText(null), authorizer.getPrincipalName()));
         result.put("openVerify", verifyFlag(account, authorizer.getVerifyType()));
@@ -93,6 +92,47 @@ public class MiniProgramSettingService {
             throw new BizException("该小程序是普通方式注册（非第三方平台 API 注册），微信不允许通过接口改名；"
                     + "请小程序管理员登录微信公众平台，在「设置 → 基本设置 → 名称」中修改");
         }
+    }
+
+    /**
+     * 小程序码图片。qrcode_url 指向 mp.weixin.qq.com 的 showqrcode，浏览器带本站 Referer 直连会被微信
+     * 换成「此图片来自微信公众平台 未经允许不可引用」的占位图，所以由后端取回原图，界面拿 data URL 显示。
+     */
+    public Map<String, Object> qrcodeImage(String appid) {
+        String url = resolveQrcodeUrl(appid);
+        byte[] image = caller.api().getBinaryAbsolute(url);
+        String format = imageFormat(image);
+        if (format == null) {
+            throw new BizException("取回的内容不是图片（PNG/JPG/GIF/BMP），微信这次没有给出小程序码");
+        }
+        String contentType = "image/" + ("jpg".equals(format) ? "jpeg" : format);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("url", url);
+        result.put("contentType", contentType);
+        result.put("size", image.length);
+        result.put("dataUrl", "data:" + contentType + ";base64,"
+                + java.util.Base64.getEncoder().encodeToString(image));
+        return result;
+    }
+
+    /** 落库的 qrcode_url 来自 api_get_authorizer_info；这一列为空的旧数据才再问一次 getaccountbasicinfo。 */
+    private String resolveQrcodeUrl(String appid) {
+        Authorizer authorizer = authorizerWriter.require(appid);
+        if (StringUtils.hasText(authorizer.getQrcodeUrl())) {
+            return authorizer.getQrcodeUrl();
+        }
+        JsonNode account = caller.authorizer(appid, "getaccountbasicinfo", MiniProgramApi::accountBasicInfo);
+        String url = qrcodeUrlOf(account, authorizer);
+        if (!StringUtils.hasText(url)) {
+            throw new BizException("微信未返回该小程序的小程序码链接，请先在授权列表「刷新资料」后重试");
+        }
+        return url;
+    }
+
+    /** 新版 getaccountbasicinfo 已不返回小程序码链接，只有 api_get_authorizer_info 的 authorizer_info.qrcode_url 有。 */
+    private static String qrcodeUrlOf(JsonNode account, Authorizer authorizer) {
+        return orText(account == null ? null
+                : firstNonEmpty(account.path("qr_code_url"), account.path("qrcode_url")), authorizer.getQrcodeUrl());
     }
 
     /** 认证状态：新版是 wx_verify_info 的两个布尔，老版是 open_verify，都没有时沿用授权方信息里的 verify_type。 */

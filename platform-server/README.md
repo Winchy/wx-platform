@@ -40,7 +40,7 @@ npm run build                    # vue-tsc --noEmit + vite build，产物 dist/
 cd platform-server && mvn -B test
 ```
 
-- 172 个用例不需要任何中间件：安全模式加解密闭环、MockWebServer 锁定的微信接口契约（路径/字段名/请求体/分帧方式）、
+- 178 个用例不需要任何中间件：安全模式加解密闭环、MockWebServer 锁定的微信接口契约（路径/字段名/请求体/分帧方式）、
   发布链路状态机（commit→提审→审核→发布/灰度/回退）、令牌链刷新与轮换回写、回调分发、微信接口域名的优先级、
   Web 层参数绑定与错误码映射。
 - 17 个 `PlatformEndToEndTest` 只在 3306 与 6379 都能连上时才执行（`@EnabledIf("infrastructureReady")`）。
@@ -212,11 +212,17 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
   授权接入的存量小程序基本都是 `register_type=0`（普通方式注册），只能由管理员在微信公众平台「设置 → 基本设置 → 名称」修改。
   `register_type` 只有 `api_get_authorizer_info` 返回，刷新授权资料时落库，`basic-info` 回 `registerType` 与
   `apiRenameSupported`（未刷新过时为 `null`，界面不拦），改名提交入口也会先拦下确证的 `0`。
+- 小程序码链接（`authorizer_info.qrcode_url` 指向的 `mp.weixin.qq.com/cgi-bin/showqrcode`）**不能直接放进 `<img src>`**：
+  微信按 Referer 防盗链，网页里引用只会拿到「此图片来自微信公众平台 未经允许不可引用」的占位图，而且 HTTP 仍是 200，界面看不出失败。
+  改由后端不带 Referer 取回原图：`GET /api/authorizers/{appid}/qrcode` 回 `{url, contentType, size, dataUrl}`，
+  界面显示 `dataUrl`，「复制图片链接」仍给微信原始直链（贴到地址栏能直接打开）。
+  落库的链接属于数据而非可信输入，抓取前校验主机（只放行 `*.weixin.qq.com`，或与 `api_base` 同主机同协议——后者供测试桩与私有部署），
+  取回的内容再按文件头确认是图片，避免把错误页当二维码显示。
 
 ## 6. 测试
 
 ```bash
-mvn -B test          # 189 个用例：172 个无需中间件 + 17 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
+mvn -B test          # 195 个用例：178 个无需中间件 + 17 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
 ```
 
 | 测试类 | 锁住的东西 |
@@ -229,7 +235,7 @@ mvn -B test          # 189 个用例：172 个无需中间件 + 17 个连本机 
 | `AuthorizerTokenRotationTest` | 令牌链：refresh_token 轮换必须回写、失效只重试一次、61023 判定授权失效 |
 | `ReleaseWorkflowTest` | 发布链路状态机：ext_json 组装、auditid 落库、AUDIT_PASS/GRAY/REVERTED 流转 |
 | `ReleaseIcpStatusTest` | 备案 1024~1031 前置条件按位解码（基本信息/类目/认证），缺项一次性列全 |
-| `MiniProgramSettingMappingTest` | 微信下划线字段 ↔ 界面驼峰字段（域名六类、invalid/noIcp、certicates 拼写）；multipart 出站带 Content-Length 而非 chunked；普通方式注册时改名本地拦下 |
+| `MiniProgramSettingMappingTest` | 微信下划线字段 ↔ 界面驼峰字段（域名六类、invalid/noIcp、certicates 拼写）；multipart 出站带 Content-Length 而非 chunked；普通方式注册时改名本地拦下；小程序码代取（落库链接优先、非微信主机零请求直接拒、回传 data URL、非图片点名） |
 | `MiniProgramPrivacySettingTest` | 隐私保护指引请求体（privacy_ver / setting_list / owner_setting） |
 | `PlatformDomainServiceTest` | 第三方平台域名白名单：`;` 拼接的裸主机名、两类接口字段名不同（`wxa_server_domain`/`wxa_jump_h5_domain`）、写后必须再 `get`、端口与空清单本地拦住 |
 | `PlatformConfigSerializationTest` | 密钥不进 toString/日志/响应，PUT 的明文密钥能正常绑定 |
@@ -436,6 +442,17 @@ E2E 的 `MockWeChatServer` 把该响应自造成为 `{grayinfo:{...}}`、并把 
 浏览器实测（桩后端可切 `register_type`）：`register_type=0` 时改名弹窗顶部亮出「该小程序不支持通过第三方平台改名…」且「提交修改」
 按钮 `disabled`；切到 `6` 后提示消失、提交后桩收到 1 次 `PUT …/nickname`，页面只弹一条「已提交微信审核，审核单号 300001」；
 头像走 `PUT …/avatar` 同样只弹一条「头像已更新，微信侧生效可能有延迟」，不再出现重复 toast。
+
+小程序码这一轮补了 6 例（后端 195 例全绿，原 189 + 6）：`qrcodeUsesStoredLink` 断言用的是落库链接、请求里没有 `Referer`、
+回传的是能解回原字节的 `data:image/png;base64,`；`qrcodeRejectsForeignHost` 把链接换成 `http://169.254.169.254/latest/meta-data/`，
+靠 `getRequestCount()` 为 0 证明**抓取前**就拒了（这类守卫只有请求数能守，桩本身照收）；
+`qrcodeRequiresHttpsForWeixinHost` 证明微信域名的 https 要求不跟着 `api_base` 的协议放松；
+另有老字段兜底、两处都缺链接时提示刷新资料、取回非图片时点名三条。
+浏览器实测（桩可切 `ok`/`fail`）：成功态 `<img>` 的 src 是后端给的 data URL、`complete` 为真、渲染 148×148，点开走 `el-image` 预览；
+失败态占位框只写「小程序码取图失败」，完整原因单独一行（实测 230px 宽、2 行换行，没被 150px 的框挤成一列一个字），
+图片节点消失、点「重新取图」切回 ok 后立刻恢复，两种状态都是 0 条 toast。
+桩只能证明本站这条链路（路由 → 服务 → 抓取 → data URL → 界面），
+「服务端不带 Referer 时微信确实回原图」仍要等真实凭据与线上域名才能确认。
 
 仍只能等真实凭据与备案域名才能验证：真实 `component_appid`/`component_secret` 换取 token、出口 IP 白名单（缺失报 `40164`）、
 公网 https 备案域名的微信侧校验、已备案小程序才允许发布、宿主机 nginx 的证书链与 `/wx/` 透传（compose 已不含 caddy）。
