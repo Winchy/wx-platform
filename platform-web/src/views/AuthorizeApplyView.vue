@@ -204,8 +204,13 @@ onMounted(() => {
           </div>
 
           <div v-if="session" class="apply-qr__body">
-            <QrCodeCanvas :text="session.authUrl" :size="236" empty-text="未生成链接">
-              <p class="apply-qr__hint">请使用小程序管理员微信「扫一扫」，或在电脑浏览器打开链接后扫码</p>
+            <QrCodeCanvas :text="session.mobileAuthUrl ?? ''" :size="236" empty-text="未生成 H5 授权链接">
+              <p class="apply-qr__hint">
+                二维码里是 H5 版授权链接：管理员用微信「扫一扫」，在手机微信内直接选择账号完成授权。
+              </p>
+              <p class="apply-qr__hint">
+                想在电脑上授权，就点「打开授权链接」访问 PC 版页面，再扫该页面上下发的微信二维码。
+              </p>
             </QrCodeCanvas>
 
             <div class="apply-qr__meta">
