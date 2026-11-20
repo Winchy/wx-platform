@@ -205,27 +205,45 @@ public class WechatApiClient {
         return binary(uri.getPath(), uri.toString(), HttpMethod.GET, null);
     }
 
-    /** 链接只来自微信响应，但落库后仍可能被改写，所以限定主机与协议，别让它变成任意 URL 抓取。 */
-    private URI imageUri(String value) {
+    /**
+     * 链接只来自微信响应，但落库后仍可能被改写，所以限定主机与协议，别让它变成任意 URL 抓取。
+     * 微信的小程序码有两个来源域名：showqrcode 在 mp.weixin.qq.com，而 api_get_authorizer_info 的
+     * qrcode_url 实测落在微信自有图片 CDN（mmbiz.qpic.cn），文档只写「二维码图片的 URL」不给域名，
+     * 所以 CDN 域必须一起放行，否则界面只会看到「域名不是微信站点」。
+     */
+    URI imageUri(String value) {
+        String trimmed = value == null ? "" : value.trim();
         URI uri;
         try {
-            uri = URI.create(value == null ? "" : value.trim());
+            uri = URI.create(trimmed);
         } catch (IllegalArgumentException ex) {
             throw new BizException("图片链接格式不合法，无法抓取");
         }
         String host = uri.getHost() == null ? "" : uri.getHost();
-        boolean weixinHost = host.equalsIgnoreCase("weixin.qq.com")
+        boolean cdnHost = wechatCdnHost(host);
+        boolean weixinHost = cdnHost || host.equalsIgnoreCase("weixin.qq.com")
                 || host.toLowerCase(java.util.Locale.ROOT).endsWith(".weixin.qq.com");
         if (!weixinHost && !host.equalsIgnoreCase(apiHost)) {
             throw new BizException("图片链接的域名不是微信站点，已拒绝抓取：" + host);
         }
         String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(java.util.Locale.ROOT);
+        // 旧数据与文档示例里的 qrcode_url 是 http 开头，同一个 CDN 路径支持 https，改写比拒绝更有用
+        if (cdnHost && "http".equals(scheme) && trimmed.regionMatches(true, 0, "http://", 0, 7)) {
+            return URI.create("https://" + trimmed.substring(7));
+        }
         String expected = weixinHost ? "https" : apiScheme;
         if (!expected.equals(scheme)) {
             throw new BizException("图片链接应为 " + expected + " 协议，当前是"
                     + (scheme.isEmpty() ? "未指定协议" : " " + scheme));
         }
         return uri;
+    }
+
+    /** 微信自有图片域名：小程序码与头像都从这里出。 */
+    private static boolean wechatCdnHost(String host) {
+        String lower = host.toLowerCase(java.util.Locale.ROOT);
+        return lower.equals("qpic.cn") || lower.endsWith(".qpic.cn")
+                || lower.equals("qlogo.cn") || lower.endsWith(".qlogo.cn");
     }
 
     /** 永久素材（如审核驳回截图）用 POST 取回，图片类型直接回二进制字节。 */

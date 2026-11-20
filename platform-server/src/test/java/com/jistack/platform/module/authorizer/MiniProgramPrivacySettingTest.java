@@ -36,7 +36,9 @@ class MiniProgramPrivacySettingTest {
     @BeforeEach
     void setUp() {
         caller = mock(WechatCaller.class);
-        service = new MiniProgramSettingService(caller, mock(AuthorizerWriter.class));
+        // 隐私指引用例不碰小程序码，副本表给个空替身即可
+        service = new MiniProgramSettingService(caller, mock(AuthorizerWriter.class),
+                mock(AuthorizerQrcodeMapper.class));
     }
 
     private JsonNode okNode() {

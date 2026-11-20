@@ -1,5 +1,6 @@
 package com.jistack.platform.wechat.client;
 
+import com.jistack.platform.common.web.BizException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import okhttp3.mockwebserver.MockResponse;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.client.RestTemplate;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -523,5 +525,38 @@ class WechatApiContractTest {
         ok("{}");
 
         assertEquals(0, MiniProgramApi.release(api, AUTHORIZER_TOKEN).path("errcode").asInt());
+    }
+
+    @Test
+    @DisplayName("小程序码链接：微信自有图片 CDN 放行，http 改写为 https 且不动路径查询串")
+    void imageUriAcceptsWechatCdn() {
+        // api_get_authorizer_info 的 qrcode_url 实际落在这里，拦掉它界面就只会显示「域名不是微信站点」
+        assertEquals("mmbiz.qpic.cn",
+                api.imageUri("https://mmbiz.qpic.cn/mmbiz_jpg/abc/0?wx_fmt=jpeg").getHost());
+        URI upgraded = api.imageUri("http://mmbiz.qpic.cn/mmbiz_jpg/abc/0?wx_fmt=jpeg");
+        assertEquals("https", upgraded.getScheme());
+        assertEquals("/mmbiz_jpg/abc/0", upgraded.getPath());
+        assertEquals("wx_fmt=jpeg", upgraded.getQuery());
+        assertEquals("wx.qlogo.cn", api.imageUri("https://wx.qlogo.cn/mmhead/xyz/0").getHost());
+        assertEquals("mp.weixin.qq.com",
+                api.imageUri("https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=X").getHost());
+        assertEquals(server.url("/").host(),
+                api.imageUri(server.url("/cgi-bin/showqrcode?ticket=X").toString()).getHost(),
+                "apiBase 指向的桩主机本来就该放行");
+    }
+
+    @Test
+    @DisplayName("小程序码链接：非微信域名、伪装后缀与 http 的微信主站一律拒绝")
+    void imageUriRejectsForeignHosts() {
+        for (String url : List.of("http://169.254.169.254/latest/meta-data/",
+                "https://attacker.example.com/mmbiz.qpic.cn/x.jpg",
+                "https://mmbiz.qpic.cn.attacker.com/x.jpg",
+                "file:///etc/passwd")) {
+            BizException ex = assertThrows(BizException.class, () -> api.imageUri(url));
+            assertTrue(ex.getMessage().contains("不是微信站点"), url + " 不该被放行");
+        }
+        BizException plain = assertThrows(BizException.class,
+                () -> api.imageUri("http://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=X"));
+        assertTrue(plain.getMessage().contains("https"), "微信主站的链接不降级成 http");
     }
 }

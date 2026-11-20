@@ -17,6 +17,8 @@ import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 
+import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -42,6 +44,9 @@ class MiniProgramSettingMappingTest {
     private MockWebServer server;
     private MiniProgramSettingService service;
     private AuthorizerWriter writer;
+    private AuthorizerQrcodeMapper qrcodeMapper;
+    /** 本地副本表的内存替身：只用来验「命中副本就不打微信」「取图成功后覆盖」「失败时回退」。 */
+    private final Map<String, AuthorizerQrcode> qrcodeRows = new HashMap<>();
 
     @BeforeEach
     void setUp() throws Exception {
@@ -65,7 +70,27 @@ class MiniProgramSettingMappingTest {
         when(writer.require(anyString())).thenReturn(new Authorizer());
         // 取图失败会先「刷新资料」再重试一次；默认换不出新链接，让首因原样抛出
         when(writer.refreshInfo(anyString())).thenReturn(new Authorizer());
-        service = new MiniProgramSettingService(caller, writer);
+        qrcodeMapper = mock(AuthorizerQrcodeMapper.class);
+        when(qrcodeMapper.selectById(any())).thenAnswer(invocation -> qrcodeRows.get(invocation.getArgument(0)));
+        when(qrcodeMapper.insert(any(AuthorizerQrcode.class))).thenAnswer(invocation -> saveRow(invocation.getArgument(0)));
+        when(qrcodeMapper.updateById(any(AuthorizerQrcode.class))).thenAnswer(invocation -> saveRow(invocation.getArgument(0)));
+        service = new MiniProgramSettingService(caller, writer, qrcodeMapper);
+    }
+
+    private int saveRow(AuthorizerQrcode entity) {
+        qrcodeRows.put(entity.getAuthorizerAppid(), entity);
+        return 1;
+    }
+
+    /** 库里已有一份后端保存的小程序码。 */
+    private AuthorizerQrcode savedRow(String sourceUrl, LocalDateTime syncedAt) {
+        AuthorizerQrcode saved = new AuthorizerQrcode();
+        saved.setAuthorizerAppid(APPID);
+        saved.setSourceUrl(sourceUrl);
+        saved.setContentType("image/png");
+        saved.setImage(pngBytes());
+        saved.setSyncedAt(syncedAt);
+        return saved;
     }
 
     @AfterEach
@@ -619,7 +644,7 @@ class MiniProgramSettingMappingTest {
         withQrcodeLink("/cgi-bin/showqrcode?ticket=gQG88Do");
         imageResponse(pngBytes(), "image/png");
 
-        Map<String, Object> result = service.qrcodeImage(APPID);
+        Map<String, Object> result = service.qrcodeImage(APPID, false);
 
         RecordedRequest request = take();
         assertThat(request.getMethod()).isEqualTo("GET");
@@ -639,7 +664,7 @@ class MiniProgramSettingMappingTest {
         ok("{\"errcode\":0,\"qr_code_url\":\"" + server.url("/cgi-bin/showqrcode?ticket=OLD") + "\"}");
         imageResponse(pngBytes(), "image/png");
 
-        assertThat(service.qrcodeImage(APPID).get("url")).asString().endsWith("/cgi-bin/showqrcode?ticket=OLD");
+        assertThat(service.qrcodeImage(APPID, false).get("url")).asString().endsWith("/cgi-bin/showqrcode?ticket=OLD");
 
         assertThat(take().getPath()).startsWith("/cgi-bin/account/getaccountbasicinfo");
         assertThat(take().getPath()).isEqualTo("/cgi-bin/showqrcode?ticket=OLD");
@@ -652,7 +677,7 @@ class MiniProgramSettingMappingTest {
         authorizer.setQrcodeUrl("http://169.254.169.254/latest/meta-data/");
         when(writer.require(anyString())).thenReturn(authorizer);
 
-        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+        assertThatThrownBy(() -> service.qrcodeImage(APPID, false))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("不是微信站点");
         assertThat(server.getRequestCount()).isZero();
@@ -665,7 +690,7 @@ class MiniProgramSettingMappingTest {
         authorizer.setQrcodeUrl("http://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=X");
         when(writer.require(anyString())).thenReturn(authorizer);
 
-        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+        assertThatThrownBy(() -> service.qrcodeImage(APPID, false))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("https");
         assertThat(server.getRequestCount()).isZero();
@@ -676,7 +701,7 @@ class MiniProgramSettingMappingTest {
     void qrcodeWithoutAnyLink() {
         ok("{\"errcode\":0,\"nickname\":\"某某协会服务\"}");
 
-        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+        assertThatThrownBy(() -> service.qrcodeImage(APPID, false))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("刷新资料");
     }
@@ -688,7 +713,7 @@ class MiniProgramSettingMappingTest {
         server.enqueue(new MockResponse().addHeader("Content-Type", "text/html")
                 .setBody("<html>ticket invalid</html>"));
 
-        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+        assertThatThrownBy(() -> service.qrcodeImage(APPID, false))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("不是图片")
                 .hasMessageContaining("HTML 页面");
@@ -700,7 +725,7 @@ class MiniProgramSettingMappingTest {
         withQrcodeLink("/cgi-bin/showqrcode?ticket=X");
         imageResponse(new byte[0], "image/jpeg");
 
-        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+        assertThatThrownBy(() -> service.qrcodeImage(APPID, false))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("空内容");
     }
@@ -712,7 +737,7 @@ class MiniProgramSettingMappingTest {
         server.enqueue(new MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_START));
 
         // 包成 IllegalStateException 只会显示「服务器内部错误: null」；透传才有 502 的「出口网络不通」
-        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+        assertThatThrownBy(() -> service.qrcodeImage(APPID, false))
                 .isInstanceOf(ResourceAccessException.class);
     }
 
@@ -736,7 +761,7 @@ class MiniProgramSettingMappingTest {
             }
         });
 
-        Map<String, Object> result = service.qrcodeImage(APPID);
+        Map<String, Object> result = service.qrcodeImage(APPID, false);
 
         assertThat(takeRequest().getPath()).isEqualTo("/cgi-bin/showqrcode?ticket=EXPIRED");
         assertThat(takeRequest().getPath()).isEqualTo("/cgi-bin/showqrcode?ticket=FRESH");
@@ -752,7 +777,7 @@ class MiniProgramSettingMappingTest {
         // 错误状态一律关连接：JDK 连接池按 host:port 复用，桩每例换端口却可能拿到同一个号
         server.enqueue(new MockResponse().setResponseCode(404).setHeader("Connection", "close"));
 
-        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+        assertThatThrownBy(() -> service.qrcodeImage(APPID, false))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("404");
         assertThat(server.getRequestCount()).isEqualTo(1);
@@ -767,9 +792,92 @@ class MiniProgramSettingMappingTest {
                 .addHeader("Content-Type", "text/html")
                 .setBody("<html>access denied</html>"));
 
-        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+        assertThatThrownBy(() -> service.qrcodeImage(APPID, false))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("403")
                 .hasMessageContaining("access denied");
+    }
+
+    @Test
+    @DisplayName("小程序码：已有本地副本时直接返回，一个微信请求都不发")
+    void qrcodeServesSavedCopyWithoutFetching() {
+        String link = server.url("/cgi-bin/showqrcode?ticket=X").toString();
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=X");
+        qrcodeRows.put(APPID, savedRow(link, LocalDateTime.now()));
+
+        Map<String, Object> result = service.qrcodeImage(APPID, false);
+
+        assertThat(result.get("source")).isEqualTo("local");
+        assertThat(result.get("staleReason")).isNull();
+        assertThat(result.get("dataUrl")).asString().startsWith("data:image/png;base64,");
+        assertThat(server.getRequestCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("小程序码：取图成功后原图连链接一起存下来")
+    void qrcodeSavesFetchedImage() {
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=NEW");
+        imageResponse(pngBytes(), "image/png");
+
+        assertThat(service.qrcodeImage(APPID, false).get("source")).isEqualTo("wechat");
+
+        AuthorizerQrcode saved = qrcodeRows.get(APPID);
+        assertThat(saved).isNotNull();
+        assertThat(saved.getImage()).isEqualTo(pngBytes());
+        assertThat(saved.getSourceUrl()).isEqualTo(server.url("/cgi-bin/showqrcode?ticket=NEW").toString());
+        assertThat(saved.getContentType()).isEqualTo("image/png");
+        assertThat(saved.getSyncedAt()).isNotNull();
+    }
+
+    @Test
+    @DisplayName("小程序码：点「重新取图」强制刷新并覆盖本地副本")
+    void qrcodeRefreshOverwritesSavedCopy() {
+        String link = server.url("/cgi-bin/showqrcode?ticket=X").toString();
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=X");
+        AuthorizerQrcode stale = savedRow(link, LocalDateTime.now());
+        stale.setImage(new byte[] {'o', 'l', 'd'});
+        qrcodeRows.put(APPID, stale);
+        imageResponse(pngBytes(), "image/png");
+
+        Map<String, Object> result = service.qrcodeImage(APPID, true);
+
+        assertThat(result.get("source")).isEqualTo("wechat");
+        assertThat(server.getRequestCount()).isEqualTo(1);
+        assertThat(qrcodeRows.get(APPID).getImage()).isEqualTo(pngBytes());
+    }
+
+    @Test
+    @DisplayName("小程序码：微信换了码或副本放久了都要重新取")
+    void qrcodeRefetchesWhenLinkChangedOrExpired() {
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=NEW");
+        qrcodeRows.put(APPID, savedRow(server.url("/cgi-bin/showqrcode?ticket=OLD").toString(),
+                LocalDateTime.now().minusDays(1)));
+        imageResponse(pngBytes(), "image/png");
+        assertThat(service.qrcodeImage(APPID, false).get("source")).isEqualTo("wechat");
+
+        // 链接没变但副本已超过 7 天：同样重新取，避免长期显示旧图
+        qrcodeRows.clear();
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=NEW");
+        qrcodeRows.put(APPID, savedRow(server.url("/cgi-bin/showqrcode?ticket=NEW").toString(),
+                LocalDateTime.now().minusDays(8)));
+        imageResponse(pngBytes(), "image/png");
+        assertThat(service.qrcodeImage(APPID, false).get("source")).isEqualTo("wechat");
+        assertThat(server.getRequestCount()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("小程序码：微信一时取不到就回退本地副本，界面不整块空白")
+    void qrcodeFallsBackToSavedCopyOnFailure() {
+        String link = server.url("/cgi-bin/showqrcode?ticket=X").toString();
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=X");
+        qrcodeRows.put(APPID, savedRow(link, LocalDateTime.now().minusDays(8)));
+        server.enqueue(new MockResponse().setResponseCode(404).setHeader("Connection", "close"));
+
+        Map<String, Object> result = service.qrcodeImage(APPID, false);
+
+        assertThat(result.get("source")).isEqualTo("local");
+        assertThat(result.get("dataUrl")).asString().startsWith("data:image/png;base64,");
+        // 首因要交给界面，否则用户只看到一张旧图、不知道其实已经取不到了
+        assertThat(result.get("staleReason")).asString().contains("404");
     }
 }

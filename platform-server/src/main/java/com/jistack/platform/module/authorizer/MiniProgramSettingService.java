@@ -7,9 +7,12 @@ import com.jistack.platform.wechat.service.WechatCaller;
 import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -49,8 +52,12 @@ public class MiniProgramSettingService {
     /** 微信文档对图片类临时素材的限制：不超过 2M，格式 PNG/JPG/JPEG/GIF/BMP（头像与改名材料共用）。 */
     private static final int MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 
+    /** 后端保存的小程序码超过这个天数才重新取一次，微信换了码不至于长期显示旧图。 */
+    private static final Duration QRCODE_TTL = Duration.ofDays(7);
+
     private final WechatCaller caller;
     private final AuthorizerWriter authorizerWriter;
+    private final AuthorizerQrcodeMapper qrcodeMapper;
 
     // -------------------------------------------------- 基本信息
 
@@ -97,10 +104,31 @@ public class MiniProgramSettingService {
     }
 
     /**
-     * 小程序码图片。qrcode_url 指向 mp.weixin.qq.com 的 showqrcode，浏览器带本站 Referer 直连会被微信
-     * 换成「此图片来自微信公众平台 未经允许不可引用」的占位图，所以由后端取回原图，界面拿 data URL 显示。
+     * 小程序码图片：优先返回后端保存的那份，没有或该刷新了才去微信取。
+     * api_get_authorizer_info 的 qrcode_url 指向微信自有图片 CDN，浏览器带本站 Referer 直连会被换成
+     * 「此图片来自微信公众平台 未经允许不可引用」的占位图，所以只能服务端取；取回的字节存下来后界面
+     * 显示的是这份副本，微信一时取不到也不会整块空白。
      */
-    public Map<String, Object> qrcodeImage(String appid) {
+    public Map<String, Object> qrcodeImage(String appid, boolean refresh) {
+        AuthorizerQrcode saved = qrcodeMapper.selectById(appid);
+        if (!refresh && usableCopy(saved) && stillCurrent(saved, authorizerWriter.require(appid).getQrcodeUrl())) {
+            return qrcodePayload(saved.getSourceUrl(), saved.getContentType(), saved.getImage(),
+                    "local", saved.getSyncedAt(), null);
+        }
+        try {
+            return fetchAndSave(appid, saved);
+        } catch (RuntimeException ex) {
+            if (!usableCopy(saved)) {
+                throw ex;
+            }
+            log.warn("小程序码取图失败，改用后端保存的副本 appid={}：{}", appid, ex.getMessage());
+            return qrcodePayload(saved.getSourceUrl(), saved.getContentType(), saved.getImage(),
+                    "local", saved.getSyncedAt(), ex.getMessage());
+        }
+    }
+
+    /** 去微信取原图，确认内容确实是图片后存下来。 */
+    private Map<String, Object> fetchAndSave(String appid, AuthorizerQrcode existing) {
         String url = resolveQrcodeUrl(appid);
         byte[] image;
         try {
@@ -114,12 +142,63 @@ public class MiniProgramSettingService {
             throw new BizException("取回的内容不是图片（PNG/JPG/GIF/BMP），微信这次没有给出小程序码：" + nonImageHint(image));
         }
         String contentType = "image/" + ("jpg".equals(format) ? "jpeg" : format);
+        LocalDateTime syncedAt = LocalDateTime.now();
+        saveCopy(appid, url, contentType, image, syncedAt, existing == null);
+        return qrcodePayload(url, contentType, image, "wechat", syncedAt, null);
+    }
+
+    private void saveCopy(String appid, String url, String contentType, byte[] image,
+                          LocalDateTime syncedAt, boolean insert) {
+        AuthorizerQrcode entity = new AuthorizerQrcode();
+        entity.setAuthorizerAppid(appid);
+        entity.setSourceUrl(url);
+        entity.setContentType(contentType);
+        entity.setImage(image);
+        entity.setSyncedAt(syncedAt);
+        if (!insert) {
+            qrcodeMapper.updateById(entity);
+            return;
+        }
+        try {
+            qrcodeMapper.insert(entity);
+        } catch (DuplicateKeyException raced) {
+            // 两个人同时点「重新取图」：后插入的那条转成更新
+            qrcodeMapper.updateById(entity);
+        }
+    }
+
+    private static boolean usableCopy(AuthorizerQrcode saved) {
+        return saved != null && saved.getImage() != null && saved.getImage().length > 0
+                && StringUtils.hasText(saved.getContentType());
+    }
+
+    /** 微信换了码（链接变了）或副本放超过 QRCODE_TTL 才重新取；链接列为空的旧数据只能按时间判断。 */
+    private static boolean stillCurrent(AuthorizerQrcode saved, String storedLink) {
+        if (saved.getSyncedAt() == null || saved.getSyncedAt().isBefore(LocalDateTime.now().minus(QRCODE_TTL))) {
+            return false;
+        }
+        String current = normalizeLink(storedLink);
+        return current.isEmpty() || current.equals(normalizeLink(saved.getSourceUrl()));
+    }
+
+    /** 抓取时 http 会被改写成 https，比较链接要先归一，否则每次都被当成换过码。 */
+    private static String normalizeLink(String value) {
+        String trimmed = value == null ? "" : value.trim();
+        return trimmed.regionMatches(true, 0, "http://", 0, 7) ? "https://" + trimmed.substring(7) : trimmed;
+    }
+
+    /** source=local 说明界面拿的是后端保存的副本；staleReason 只在副本兜底时非空。 */
+    private static Map<String, Object> qrcodePayload(String url, String contentType, byte[] image,
+                                                     String source, LocalDateTime savedAt, String staleReason) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("url", url);
         result.put("contentType", contentType);
         result.put("size", image.length);
         result.put("dataUrl", "data:" + contentType + ";base64,"
                 + java.util.Base64.getEncoder().encodeToString(image));
+        result.put("source", source);
+        result.put("savedAt", savedAt);
+        result.put("staleReason", staleReason);
         return result;
     }
 

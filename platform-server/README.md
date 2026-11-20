@@ -212,17 +212,25 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
   授权接入的存量小程序基本都是 `register_type=0`（普通方式注册），只能由管理员在微信公众平台「设置 → 基本设置 → 名称」修改。
   `register_type` 只有 `api_get_authorizer_info` 返回，刷新授权资料时落库，`basic-info` 回 `registerType` 与
   `apiRenameSupported`（未刷新过时为 `null`，界面不拦），改名提交入口也会先拦下确证的 `0`。
-- 小程序码链接（`authorizer_info.qrcode_url` 指向的 `mp.weixin.qq.com/cgi-bin/showqrcode`）**不能直接放进 `<img src>`**：
-  微信按 Referer 防盗链，网页里引用只会拿到「此图片来自微信公众平台 未经允许不可引用」的占位图，而且 HTTP 仍是 200，界面看不出失败。
-  改由后端不带 Referer 取回原图：`GET /api/authorizers/{appid}/qrcode` 回 `{url, contentType, size, dataUrl}`，
-  界面显示 `dataUrl`，「复制图片链接」仍给微信原始直链（贴到地址栏能直接打开）。
-  落库的链接属于数据而非可信输入，抓取前校验主机（只放行 `*.weixin.qq.com`，或与 `api_base` 同主机同协议——后者供测试桩与私有部署），
-  取回的内容再按文件头确认是图片，避免把错误页当二维码显示。
+- 小程序码链接（`api_get_authorizer_info` 的 `authorizer_info.qrcode_url`）**不能直接放进 `<img src>`**：微信按 Referer 防盗链，
+  网页里引用只会拿到「此图片来自微信公众平台 未经允许不可引用」的占位图，而且 HTTP 仍是 200，界面看不出失败。
+  现网这条链接指向的是微信自有图片 CDN（`mmbiz.qpic.cn`，头像在 `qlogo.cn`），**不是** `mp.weixin.qq.com/cgi-bin/showqrcode`，
+  所以服务端抓取白名单放行 `*.weixin.qq.com`、`*.qpic.cn`、`*.qlogo.cn`，以及与 `api_base` 同主机的地址（后者供测试桩与私有部署）；
+  微信 CDN 上仍有 `http://` 写法，同一 CDN 路径支持 https，因此这类主机的 http 直接改写成 https 而不是拒绝。
+  白名单只比主机名结尾，`mmbiz.qpic.cn.attacker.com` 这种伪装会被拦下（由 `WechatApiContractTest` 守住）。
+- 取回的原图**存进 `wechat_authorizer_qrcode`（主键 appid，`MEDIUMBLOB`）**，`GET /api/authorizers/{appid}/qrcode`
+  回 `{url, contentType, size, dataUrl, source, savedAt, staleReason}`：`source=local` 表示这次读的是后端已保存的副本
+  （**不发微信请求**），`source=wechat` 表示刚从微信取回并覆盖了副本；`?refresh=true` 是界面「重新取图」用的强制回源。
+  回源失败但库里已有副本时仍返回副本，把失败原因放进 `staleReason` 让界面写明，而不是整块空白；库里没副本才把错误抛出。
+  副本只有在落库的 `qrcode_url` 变了（微信换了 ticket）或超过 7 天才回源，比较链接前先归一 http/https。
+  存库而不是存容器磁盘：`deploy/docker-compose.yml` 的 `api` 服务没挂卷，文件在每次 `build`/`up -d` 后就没，
+  而单独一张表（不是 `wechat_authorizer` 的一列）能让列表查询永远不把图片字节捞出来。
 - `showqrcode` 的 `ticket` 是微信一次性签发的，**过期后直接回 HTTP 404 且响应体为空、不带 errcode**（本机对真实
   `mp.weixin.qq.com` 域名实测过这个形状）。落库链接里的 ticket 多半随时间失效，所以取图失败会自动调一次
   `api_get_authorizer_info` 换新链接重试，响应里的 `url` 是实际取到图的那条（否则「复制图片链接」复制出去仍是过期 ticket）；
   新链接与旧链接相同则不重试，直接把首因抛出。抓取失败分四类可见：非微信主机→抓取前就拒；连接中断→502 并提示出口网络；
   微信回 4xx→带上状态码与错误体片段；回 200 但不是图片→说明回来的是 HTML/JSON/空体。
+  取回的内容再按文件头确认是图片，避免把错误页当二维码显示。
 - 「消息与事件接收 URL」被**不带参数**访问时必须回一行纯文本，不能抛 `MissingServletRequestParameterException`：
   必填 `@RequestParam` 会让每次探测产生一整段 ERROR 栈（容器健康检查原先正是打这个地址，每 30 秒刷一条，把同期真正要查的错误淹掉）。
   健康检查改打独立的 `GET /wx/health`；缺参/无映射各有一行日志的处理器；`BizException` 现在也记一行 WARN（以前界面显示中文原因、日志完全空白）。
@@ -232,26 +240,26 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
 ## 6. 测试
 
 ```bash
-mvn -B test          # 202 个用例：185 个无需中间件 + 17 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
+mvn -B test          # 210 个用例：192 个无需中间件 + 18 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
 ```
 
 | 测试类 | 锁住的东西 |
 | --- | --- |
 | `WeChatMsgCryptTest` | 安全模式签名与加解密闭环（回调 URL 校验、ticket 解密） |
-| `WechatApiContractTest` | 每个微信接口的路径、鉴权参数放哪、请求体字段名与类型（`auditid` 必须是 number，不是字符串） |
+| `WechatApiContractTest` | 每个微信接口的路径、鉴权参数放哪、请求体字段名与类型（`auditid` 必须是 number，不是字符串）；图片抓取主机白名单（放行 `*.qpic.cn`/`*.qlogo.cn`/`*.weixin.qq.com`/桩主机，CDN 的 http 改写成 https，`mmbiz.qpic.cn.attacker.com` 与 `169.254.169.254` 一律拒） |
 | `WechatClientFactoryTest` | 微信接口域名优先级：库里的 api_base 覆盖 `WECHAT_API_BASE`，留空才回落 |
 | `WeChatCallbackDispatchTest` | 回调分发：ticket/授权/解除授权各落到哪一层，签名不过仍回 success，事件表留档字段 |
 | `ComponentTokenLifecycleTest` | component_access_token 生命周期：无 ticket 的 409、锁竞争、61023 判定 ticket 过期 |
 | `AuthorizerTokenRotationTest` | 令牌链：refresh_token 轮换必须回写、失效只重试一次、61023 判定授权失效 |
 | `ReleaseWorkflowTest` | 发布链路状态机：ext_json 组装、auditid 落库、AUDIT_PASS/GRAY/REVERTED 流转 |
 | `ReleaseIcpStatusTest` | 备案 1024~1031 前置条件按位解码（基本信息/类目/认证），缺项一次性列全 |
-| `MiniProgramSettingMappingTest` | 微信下划线字段 ↔ 界面驼峰字段（域名六类、invalid/noIcp、certicates 拼写）；multipart 出站带 Content-Length 而非 chunked；普通方式注册时改名本地拦下；小程序码代取（落库链接优先、非微信主机零请求直接拒、回传 data URL、非图片/空体/4xx/连接中断四类失败各有可读原因、ticket 过期自动刷新资料换新链接重试） |
+| `MiniProgramSettingMappingTest` | 微信下划线字段 ↔ 界面驼峰字段（域名六类、invalid/noIcp、certicates 拼写）；multipart 出站带 Content-Length 而非 chunked；普通方式注册时改名本地拦下；小程序码代取（落库链接优先、非微信主机零请求直接拒、回传 data URL、非图片/空体/4xx/连接中断四类失败各有可读原因、ticket 过期自动刷新资料换新链接重试）；本地副本（有副本时零微信请求、取回后写库、`refresh=true` 覆盖副本、链接变了或超过 7 天才回源、回源失败退回报副本并带 `staleReason`） |
 | `MiniProgramPrivacySettingTest` | 隐私保护指引请求体（privacy_ver / setting_list / owner_setting） |
 | `PlatformDomainServiceTest` | 第三方平台域名白名单：`;` 拼接的裸主机名、两类接口字段名不同（`wxa_server_domain`/`wxa_jump_h5_domain`）、写后必须再 `get`、端口与空清单本地拦住 |
 | `PlatformConfigSerializationTest` | 密钥不进 toString/日志/响应，PUT 的明文密钥能正常绑定 |
 | `PlatformConfigServiceTest` | 单行配置不自动补默认域名（否则 `WECHAT_API_BASE` 失效）、空串能清掉覆盖项、缺字段保持原值 |
 | `PlatformWebContractTest` | Controller 参数绑定、微信 errcode 与 HTTP 状态的映射、分页信封、平台密钥只回掩码 |
-| `PlatformEndToEndTest` | 从扫码授权到发布/灰度/回退的完整链路（桩微信 + 真库表），含操作日志按 `commit`/`release` 等微信接口名精确检索、撤回与加速审核（含不传 `auditId` 的回落） |
+| `PlatformEndToEndTest` | 从扫码授权到发布/灰度/回退的完整链路（桩微信 + 真库表），含操作日志按 `commit`/`release` 等微信接口名精确检索、撤回与加速审核（含不传 `auditId` 的回落）、小程序码在真 MySQL 上的 `MEDIUMBLOB` 字节往返（`V5` 迁移建表 + 第二次读取零微信请求 + `refresh=true` 才回源） |
 
 已在本机连真库、连真微信域名验证过（2026-11-17）：登录、凭据保存且只回掩码、安全模式的回调 URL 校验与票据推送
 （含签名不符仍回 `success`、`/wx/callback/{appid}` 代收路径）、健康检查真实请求 `api.weixin.qq.com`
@@ -482,6 +490,34 @@ E2E 的 `MockWeChatServer` 把该响应自造成为 `{grayinfo:{...}}`、并把 
 取图的真因仍要部署后看那一行新日志确认（`docker compose logs api | grep -E "业务异常|微信图片接口"`），
 头号候选是过期 ticket——现在有自动刷新重试，界面若仍失败会直接写明是 404、连接不通还是内容不是图片。
 
+第二次线上反馈是「小程序码仍然不能显示」，界面那行原因把真因直接指出来了：`图片链接的域名不是微信站点，已拒绝抓取：mmbiz.qpic.cn`——
+**是上一轮自己加的抓取守卫把微信的自有图片 CDN 拦了**（当时只放行 `*.weixin.qq.com` 与 `api_base` 同主机，而现网 `qrcode_url`
+是 `mmbiz.qpic.cn`，头像在 `qlogo.cn`，且文档示例里还有 `http://` 写法）。放行这两类 CDN 主机、并对 CDN 主机的 http 改写成 https
+（同一 CDN 路径支持 https，改写比拒绝有用），比较副本链接时先归一协议。守卫的回归由 `WechatApiContractTest` 新增 2 例守住：
+放行侧列全 `mmbiz.qpic.cn`/`wx.qlogo.cn`/`mp.weixin.qq.com`/桩主机，拒绝侧包含 `169.254.169.254`、
+`attacker.example.com/mmbiz.qpic.cn/…`、`mmbiz.qpic.cn.attacker.com`（只比后缀结尾就会被绕开的那一类）与 `file:///etc/passwd`。
+
+按「后端获取小程序码并保存至本地，向前端返回后端保存的小程序码」把存储做进了链路：`V5__authorizer_qrcode_image.sql` 建
+`wechat_authorizer_qrcode`（主键就是 `authorizer_appid`，图片是 `MEDIUMBLOB`）配 `AuthorizerQrcodeMapper`，
+`qrcodeImage(appid, refresh)` 变成三种走向——库里有可用副本且链接没变、没过期就**直接回副本（一个微信请求都不发）**；
+`refresh=true`（界面「重新取图」）或链接变了/副本超过 7 天才回源并覆盖；回源失败但库里有副本时仍回副本，把失败原因放进
+`staleReason`。存库而不是存容器磁盘的理由写进了 §5：`api` 服务没挂卷，落盘的文件每次重新部署就没。
+前端 `AuthorizerQrcode` 多出 `source`/`savedAt`/`staleReason` 三个字段，界面上是「后端保存于 …」/「刚从微信取回，存于 …」
+一行说明，副本兜底时额外一行橙色写明这次为什么没取到。
+本轮补 8 例（202 → 210，其中 E2E 17 → 18）：`MiniProgramSettingMappingTest` 5 例守读/存/覆盖/回源条件/回退，
+`PlatformEndToEndTest` 那 1 例是唯一能证明 **MyBatis 的 `byte[]` 往返与 `V5` 迁移在真 MySQL 上成立**的用例——
+单元用例里的 Mapper 是内存 `Map` 替身，字节有没有被截断、`map-underscore-to-camel-case` 认不认这张表都守不住；
+它同时断言第二次读取时桩微信的 `showqrcode` 调用计数不涨（只数 `showqrcode`，因为那台桩是所有用例共用的，
+`TicketPushWatchdog` 之类的后台任务也会在 2 分钟后开始留痕）。
+浏览器实测（桩后端按后端新形状返回，三种状态都看过渲染 DOM）：默认态 `<img>` 148×148、`complete` 为真、下一行是
+「后端保存于 2026-11-20 18:16:55」（`LocalDateTime` 无时区串被 `formatDateTime` 正常解析，不是 `—`）；
+点「重新取图」后 `uistub-access.log` 里是 `GET /api/authorizers/{appid}/qrcode?refresh=true`，文案换成「刚从微信取回，存于 …」；
+把桩切成回源失败后图片仍在，下方多一行 `rgb(230, 162, 60)`（即 `--el-color-warning`）的失效原因。
+这一轮 `take_screenshot` 仍拿不到画面（内嵌浏览器 surface 是 hidden），所以证据只有尺寸/颜色/文本这类渲染值与访问日志；
+`click` 有一次落在刚渲染出的 `el-button` 上没发出请求，改用 `evaluate_script` 派发才看到 `?refresh=true`，结论以日志为准。
+仍然没被证明的：服务端带着放行后的白名单去请求**真实** `mmbiz.qpic.cn` 直链能否取回原图（要部署后那一次真实请求，
+`docker compose logs api | grep 业务异常`），以及首次部署时 `V5` 迁移在既有库上跑不跑得干净。
+
 仍只能等真实凭据与备案域名才能验证：真实 `component_appid`/`component_secret` 换取 token、出口 IP 白名单（缺失报 `40164`）、
 公网 https 备案域名的微信侧校验、已备案小程序才允许发布、宿主机 nginx 的证书链与 `/wx/` 透传（compose 已不含 caddy）。
 第三方平台的加急额度余量也没有可查接口，用超了只能等微信返回错误码。
@@ -503,6 +539,11 @@ E2E 的 `MockWeChatServer` 把该响应自造成为 `{grayinfo:{...}}`、并把 
 3. **第一个真实调用**：发布工作台头部点「刷新令牌」→ 看步骤六「微信侧线上版」与步骤二的体验版行（这两个数就是直接问微信要来的）。
    这一步同时验证 `component_access_token` → `authorizer_access_token` 链路和权限集 18；报 `48001` 说明商家授权时没勾上代码类权限集，
    走「重新授权」补齐即可。
+   同一时刻在「基本信息」页能确认小程序码这条链：先点「刷新资料」（`qrcode_url` 只来自 `api_get_authorizer_info`），
+   首次进页面后端去 `mmbiz.qpic.cn` 取原图并存进 `wechat_authorizer_qrcode`，界面写「刚从微信取回，存于 …」；
+   再进一次该页应写成「后端保存于 …」，且 `docker compose logs api` 里没有新增取图记录——说明读的是库里的副本。
+   出现橙色那行失效原因时按它分流：`404`/空内容＝落库链接里的 ticket 过期（会自动刷新资料重试一次）、
+   连接不通＝出口网络或 IP 白名单、`不是图片`＝回来的是错误页而不是二维码。
 4. **上传代码 → 体验版**：选模板提交代码包，然后点步骤二的「刷新二维码」拿到真实体验版二维码，扫码进体验版；
    再把 `GET /wxa/get_page` 的清单与模板实际页面对一遍——提审面板的候选就来自这里，清单为空说明这次 commit 没成功。
 5. **提审 → 审核 → 发布**：提交审核后界面每 30 秒自动查一次；`status=4`（审核延后）会留在「审核中」继续轮询，不要当驳回处理。

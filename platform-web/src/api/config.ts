@@ -29,12 +29,19 @@ export interface NicknameCheckResult {
   wording: string
 }
 
-/** 小程序码：dataUrl 供界面显示，url 是微信原始的 showqrcode 直链（复制用，直接打开能看到图，嵌进网页会被防盗链拦下） */
+/**
+ * 小程序码：后端代取并保存一份，dataUrl 就是后端保存的这张图（微信图片 CDN 有 Referer 防盗链，
+ * 浏览器直连只会拿到「未经允许不可引用」的占位图）。source=local 表示这次用的是副本，
+ * staleReason 非空说明微信一时取不到、界面显示的是此前保存的那份。url 是微信原始直链，仅供复制。
+ */
 export interface AuthorizerQrcode {
   url: string
   contentType: string
   size: number
   dataUrl: string
+  source: 'local' | 'wechat'
+  savedAt: string
+  staleReason?: string
 }
 
 /** 材料都是「新增临时素材」换来的 media_id：个人主体填 idCard，组织主体（协会/企业）填 license */
@@ -166,9 +173,13 @@ export function getBasicInfo(appid: string): Promise<BasicInfo> {
   return get<BasicInfo>(`/authorizers/${appid}/basic-info`)
 }
 
-/** 小程序码取图：后端代取，绕开微信对 showqrcode 的 Referer 防盗链 */
-export function getAuthorizerQrcode(appid: string): Promise<AuthorizerQrcode> {
-  return get<AuthorizerQrcode>(`/authorizers/${appid}/qrcode`, undefined, SILENT)
+/** 小程序码取图：默认拿后端已保存的那份，refresh=true 才让后端重新去微信取一张并覆盖保存。 */
+export function getAuthorizerQrcode(appid: string, refresh = false): Promise<AuthorizerQrcode> {
+  return get<AuthorizerQrcode>(
+    `/authorizers/${appid}/qrcode`,
+    refresh ? { refresh: true } : undefined,
+    SILENT
+  )
 }
 
 /** 改名前先检测名称是否命中关键词 */

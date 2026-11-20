@@ -25,9 +25,20 @@ class MockWeChatServer extends Dispatcher {
     /** 服务状态是桩里唯一可写的状态：close 之后 getvisitstatus 必须回 0，否则测不出「改完再读」是否生效。 */
     private volatile int visitStatus = 1;
 
+    /** 桩自己的基地址：小程序码链接必须指向它，客户端才允许抓取（只放行 apiBase 主机与微信域名）。 */
+    private volatile String baseUrl = "https://mock.example";
+
     /** 1x1 PNG：体验版二维码接口返回二进制，不能用 JSON 桩。 */
     private static final byte[] PNG_PIXEL = java.util.Base64.getDecoder().decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==");
+
+    static byte[] pngBytes() {
+        return PNG_PIXEL.clone();
+    }
+
+    void useBaseUrl(String url) {
+        baseUrl = url;
+    }
 
     @NotNull
     @Override
@@ -38,7 +49,7 @@ class MockWeChatServer extends Dispatcher {
         }
         String last = path.replaceAll("/+$", "");
         last = last.substring(last.lastIndexOf('/') + 1);
-        if ("get_qrcode".equals(last)) {
+        if ("get_qrcode".equals(last) || "/cgi-bin/showqrcode".equals(path)) {
             okio.Buffer buffer = new okio.Buffer();
             buffer.write(PNG_PIXEL, 0, PNG_PIXEL.length);
             return new MockResponse().setHeader("Content-Type", "image/png").setBody(buffer);
@@ -89,14 +100,14 @@ class MockWeChatServer extends Dispatcher {
             case "api_get_authorizer_info" -> flat("""
                     {"errcode":0,"errmsg":"ok","authorizer_info":{
                       "nick_name":"_mock_协会小程序","head_img":"https://mock.example/avatar.png",
-                      "qrcode_url":"https://mock.example/qr-authorizer.png",
+                      "qrcode_url":"%s/cgi-bin/showqrcode?ticket=MOCK_QRCODE",
                       "user_name":"gh_xzmock","principal_name":"某某行业协会","alias":"xzmock",
                       "signature":"服务协会会员专属入口",
                       "service_type_info":{"id":1},"verify_type_info":{"id":-1},"register_type":6,"business_info":[],
                       "MiniProgramInfo":{"current_version":"1.0.9"}},
                      "authorization_info":{"authorizer_appid":"%s",
                       "func_info":[{"funcscope_category":{"id":1}},{"funcscope_category":{"id":4}}]}}
-                    """.formatted(AUTHORIZER_APPID));
+                    """.formatted(baseUrl, AUTHORIZER_APPID));
             case "api_start_push_ticket" -> json("errcode", 0, "errmsg", "ok");
             case "modify_wxa_server_domain" -> flat("""
                     {"errcode":0,"errmsg":"ok",

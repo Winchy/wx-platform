@@ -66,10 +66,14 @@ public class MiniProgramSettingController {
         return ApiResponse.ok(settingService.basicInfo(appid));
     }
 
-    /** 小程序码图片由后端代取（微信的 showqrcode 直链有 Referer 防盗链），界面拿 dataUrl 显示。 */
+    /**
+     * 小程序码图片：默认给后端保存的那份（微信图片 CDN 有 Referer 防盗链，只能服务端取），
+     * refresh=true 才重新去微信取一张并覆盖保存。界面拿 dataUrl 显示。
+     */
     @GetMapping("/qrcode")
-    public ApiResponse<Map<String, Object>> qrcode(@PathVariable String appid) {
-        return ApiResponse.ok(settingService.qrcodeImage(appid));
+    public ApiResponse<Map<String, Object>> qrcode(@PathVariable String appid,
+                                                   @RequestParam(defaultValue = "false") boolean refresh) {
+        return ApiResponse.ok(settingService.qrcodeImage(appid, refresh));
     }
 
     @PostMapping("/nickname/check")

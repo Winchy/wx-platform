@@ -16,7 +16,7 @@ import {
   type NicknameCheckResult
 } from '@/api/config'
 import { EmptyState, FormDialog, JsonBlock } from '@/components'
-import { copyToClipboard, displayValue } from '@/utils/format'
+import { copyToClipboard, displayValue, formatDateTime } from '@/utils/format'
 import { describeError } from '@/utils/request'
 
 const props = defineProps<{ appid: string }>()
@@ -113,8 +113,11 @@ async function load(): Promise<void> {
   await loadQrcode()
 }
 
-/** 小程序码由后端代取：微信的 showqrcode 直链有 Referer 防盗链，浏览器直连只会拿到「未经允许不可引用」的占位图。 */
-async function loadQrcode(): Promise<void> {
+/**
+ * 小程序码由后端代取并保存一份（微信图片 CDN 有 Referer 防盗链，浏览器直连只会拿到「未经允许不可引用」
+ * 的占位图）。默认直接取后端已存的那份，refresh=true 才让后端重新去微信取。
+ */
+async function loadQrcode(refresh = false): Promise<void> {
   qrcode.value = null
   qrcodeError.value = ''
   if (!props.appid || !info.value?.qrCodeUrl) {
@@ -122,7 +125,7 @@ async function loadQrcode(): Promise<void> {
   }
   qrcodeLoading.value = true
   try {
-    qrcode.value = await getAuthorizerQrcode(props.appid)
+    qrcode.value = await getAuthorizerQrcode(props.appid, refresh)
   } catch (error) {
     qrcodeError.value = describeError(error)
   } finally {
@@ -332,9 +335,19 @@ defineExpose({ reload: load })
             <span>{{ qrcodeError ? '小程序码取图失败' : '暂无小程序码' }}</span>
           </div>
           <div v-if="info.qrCodeUrl" class="basic-info__qrcode-actions">
-            <el-button text size="small" :loading="qrcodeLoading" :icon="Refresh" @click="loadQrcode()">重新取图</el-button>
+            <el-button text size="small" :loading="qrcodeLoading" :icon="Refresh" @click="loadQrcode(true)">重新取图</el-button>
             <el-button text size="small" :icon="Link" @click="copyQrCodeUrl">复制图片链接</el-button>
           </div>
+          <p v-if="qrcode" class="muted basic-info__qrcode-reason">
+            {{ qrcode.source === 'local' ? '后端保存于' : '刚从微信取回，存于' }} {{ formatDateTime(qrcode.savedAt) }}
+          </p>
+          <p
+            v-if="qrcode?.staleReason"
+            class="basic-info__qrcode-reason"
+            style="color: var(--el-color-warning)"
+          >
+            微信这次取图失败（{{ qrcode.staleReason }}），上面显示的是后端此前保存的小程序码。
+          </p>
           <p v-if="qrcodeError" class="muted basic-info__qrcode-reason">{{ qrcodeError }}</p>
         </div>
       </div>
@@ -363,9 +376,10 @@ defineExpose({ reload: load })
             别的途径拿到的素材 id 微信不认（40007）。图片 2M 以内，一年可申请修改 5 次。
           </li>
           <li>
-            小程序码由后端代取再显示：微信对 <span class="mono">showqrcode</span> 直链做了 Referer 防盗链，
-            网页里直接引用只会拿到「此图片来自微信公众平台 未经允许不可引用」的占位图。
-            「复制图片链接」给出的仍是微信原始直链，粘贴到浏览器地址栏能直接打开。
+            小程序码由后端取回并保存一份再显示：微信把图片放在自己的图片域名（<span class="mono">mmbiz.qpic.cn</span>）上并做了
+            Referer 防盗链，网页里直接引用只会拿到「此图片来自微信公众平台 未经允许不可引用」的占位图。
+            打开页面用的是后端已保存的那份，点「重新取图」才重新问微信要一次；微信一时取不到时仍显示已保存的这份，
+            并在下方写明失败原因。「复制图片链接」给出的仍是微信原始直链，粘贴到浏览器地址栏能直接打开。
           </li>
         </ul>
       </div>

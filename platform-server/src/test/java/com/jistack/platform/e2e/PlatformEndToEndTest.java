@@ -38,6 +38,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -90,7 +91,10 @@ class PlatformEndToEndTest {
             throw new IllegalStateException("桩微信服务启动失败", ex);
         }
         String url = WX_SERVER.url("/").toString();
-        return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+        String base = url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+        // 桩要把自己主机上的小程序码链接交给后端，客户端才允许抓取并存下来
+        WX_DISPATCHER.useBaseUrl(base);
+        return base;
     }
 
     /** 没有本机 docker compose 的 MySQL/Redis 时整类跳过，避免无基础设施的环境误报。 */
@@ -744,7 +748,7 @@ class PlatformEndToEndTest {
         assertThat(basic.path("nickname").asText()).contains("协会小程序");
         assertThat(basic.path("signature").asText()).isEqualTo("服务协会会员");
         assertThat(basic.path("avatarUrl").asText()).isEqualTo("https://mock.example/avatar.png");
-        assertThat(basic.path("qrCodeUrl").asText()).isEqualTo("https://mock.example/qr-authorizer.png");
+        assertThat(basic.path("qrCodeUrl").asText()).endsWith("/cgi-bin/showqrcode?ticket=MOCK_QRCODE");
         assertThat(basic.path("userName").asText()).isEqualTo("gh_xzmock");
         assertThat(basic.path("principalName").asText()).isEqualTo("某某行业协会");
         assertThat(basic.path("openVerify").asInt()).isZero();
@@ -818,7 +822,47 @@ class PlatformEndToEndTest {
         assertThat(WX_DISPATCHER.called("/wxa/bind_tester")).isTrue();
     }
 
+    @Test
+    @DisplayName("小程序码：后端取回后存库，再次读取用的是本地副本而不是回源微信")
+    void qrcodeSavedLocally() throws Exception {
+        // 小程序码链接只有 api_get_authorizer_info 给，先刷新一次资料把它落到库上
+        api(HttpMethod.POST, "/api/authorizers/" + AUTHORIZER_APPID + "/refresh", null);
+
+        JsonNode first = api(HttpMethod.GET, "/api/authorizers/" + AUTHORIZER_APPID + "/qrcode", null);
+        assertThat(first.path("source").asText()).isEqualTo("wechat");
+        assertThat(first.path("url").asText())
+                .isEqualTo(WECHAT_API_BASE + "/cgi-bin/showqrcode?ticket=MOCK_QRCODE");
+        assertThat(first.path("contentType").asText()).isEqualTo("image/png");
+        assertThat(first.path("savedAt").asText()).isNotBlank();
+        byte[] fetched = Base64.getDecoder()
+                .decode(first.path("dataUrl").asText().substring("data:image/png;base64,".length()));
+        // BLOB 往返：存进库再读出来，一个字节都不能变
+        assertThat(fetched).isEqualTo(MockWeChatServer.pngBytes());
+
+        JsonNode second = api(HttpMethod.GET, "/api/authorizers/" + AUTHORIZER_APPID + "/qrcode", null);
+        assertThat(second.path("source").asText()).isEqualTo("local");
+        assertThat(second.path("dataUrl").asText()).isEqualTo(first.path("dataUrl").asText());
+        assertThat(staleReason(second)).isEmpty();
+        assertThat(showqrcodeCalls()).isEqualTo(1L);
+
+        JsonNode forced = api(HttpMethod.GET, "/api/authorizers/" + AUTHORIZER_APPID + "/qrcode?refresh=true", null);
+        assertThat(forced.path("source").asText()).isEqualTo("wechat");
+        assertThat(showqrcodeCalls()).isEqualTo(2L);
+    }
+
     // ------------------------------------------------------------------ 辅助
+
+    /** 只数小程序码取图请求：桩服务是所有用例共用的，后台任务也会在同一台桩上留痕。 */
+    private static long showqrcodeCalls() {
+        return WX_DISPATCHER.calledPaths().stream()
+                .filter(path -> path.endsWith("/cgi-bin/showqrcode"))
+                .count();
+    }
+
+    /** staleReason 为 null 时 Jackson 的 non_null 会整个省掉这个字段。 */
+    private static String staleReason(JsonNode qrcode) {
+        return qrcode.path("staleReason").asText("");
+    }
 
     private void login() throws Exception {
         JsonNode data = api(HttpMethod.POST, "/api/auth/login",
