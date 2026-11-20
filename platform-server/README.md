@@ -40,10 +40,10 @@ npm run build                    # vue-tsc --noEmit + vite build，产物 dist/
 cd platform-server && mvn -B test
 ```
 
-- 161 个用例不需要任何中间件：安全模式加解密闭环、MockWebServer 锁定的微信接口契约（路径/字段名/请求体）、
+- 172 个用例不需要任何中间件：安全模式加解密闭环、MockWebServer 锁定的微信接口契约（路径/字段名/请求体/分帧方式）、
   发布链路状态机（commit→提审→审核→发布/灰度/回退）、令牌链刷新与轮换回写、回调分发、微信接口域名的优先级、
   Web 层参数绑定与错误码映射。
-- 16 个 `PlatformEndToEndTest` 只在 3306 与 6379 都能连上时才执行（`@EnabledIf("infrastructureReady")`）。
+- 17 个 `PlatformEndToEndTest` 只在 3306 与 6379 都能连上时才执行（`@EnabledIf("infrastructureReady")`）。
   它们用随机库名 `wxplat_e2e_*` + Redis db9，跑完 drop，不污染开发数据；微信侧由 MockWebServer 桩出来，
   不需要真实凭据、也不需要公网域名。没起容器时这些用例显示 skipped，不是失败。
 
@@ -202,11 +202,21 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
   出错时才回 JSON，所以按 Content-Type 区分错误、再按文件头判断 MIME（素材接口不回 Content-Type），界面拿到的是 `data:` URL。
   后端 `GET /api/authorizers/{appid}/audit/screenshots` 返回 `[{mediaId, contentType, dataUrl}]`，
   「审核结果」面板只在驳回时按需请求一次，缩略图用 `el-image` 点开可放大。
+- multipart 上传（`/cgi-bin/media/upload` 头像与改名材料、`/wxa/uploadmedia` 提审素材）**必须带 Content-Length**。
+  Spring 把 `MultiValueMap` 交给 `FormHttpMessageConverter` 时实测发的是 `Transfer-Encoding: chunked`
+  （`SimpleClientHttpRequestFactory` 与 `JdkClientHttpRequestFactory` 都一样），微信在接收请求体途中直接断连接，
+  报 `Error writing request body to server`；文档示例是 `curl -F`，即一次性带长度的请求体。
+  因此 `WechatApiClient.multipart` 自己拼 boundary 与分段、显式设长度，不再走转换器；
+  MockWebServer 两种分帧都收，所以只有 `multipartUploadSendsContentLength` 那条用例能从请求头上守住。
+- 接口改名（`/wxa/setnickname`）**只对「通过 API 注册」的小程序开放**，否则微信回 `91001 not fast register`；
+  授权接入的存量小程序基本都是 `register_type=0`（普通方式注册），只能由管理员在微信公众平台「设置 → 基本设置 → 名称」修改。
+  `register_type` 只有 `api_get_authorizer_info` 返回，刷新授权资料时落库，`basic-info` 回 `registerType` 与
+  `apiRenameSupported`（未刷新过时为 `null`，界面不拦），改名提交入口也会先拦下确证的 `0`。
 
 ## 6. 测试
 
 ```bash
-mvn -B test          # 177 个用例：161 个无需中间件 + 16 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
+mvn -B test          # 189 个用例：172 个无需中间件 + 17 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
 ```
 
 | 测试类 | 锁住的东西 |
@@ -219,7 +229,7 @@ mvn -B test          # 177 个用例：161 个无需中间件 + 16 个连本机 
 | `AuthorizerTokenRotationTest` | 令牌链：refresh_token 轮换必须回写、失效只重试一次、61023 判定授权失效 |
 | `ReleaseWorkflowTest` | 发布链路状态机：ext_json 组装、auditid 落库、AUDIT_PASS/GRAY/REVERTED 流转 |
 | `ReleaseIcpStatusTest` | 备案 1024~1031 前置条件按位解码（基本信息/类目/认证），缺项一次性列全 |
-| `MiniProgramSettingMappingTest` | 微信下划线字段 ↔ 界面驼峰字段（域名六类、invalid/noIcp、certicates 拼写） |
+| `MiniProgramSettingMappingTest` | 微信下划线字段 ↔ 界面驼峰字段（域名六类、invalid/noIcp、certicates 拼写）；multipart 出站带 Content-Length 而非 chunked；普通方式注册时改名本地拦下 |
 | `MiniProgramPrivacySettingTest` | 隐私保护指引请求体（privacy_ver / setting_list / owner_setting） |
 | `PlatformDomainServiceTest` | 第三方平台域名白名单：`;` 拼接的裸主机名、两类接口字段名不同（`wxa_server_domain`/`wxa_jump_h5_domain`）、写后必须再 `get`、端口与空清单本地拦住 |
 | `PlatformConfigSerializationTest` | 密钥不进 toString/日志/响应，PUT 的明文密钥能正常绑定 |
@@ -414,6 +424,18 @@ E2E 的 `MockWeChatServer` 把该响应自造成为 `{grayinfo:{...}}`、并把 
 顺带抓到一个纯视觉回归：`el-autocomplete` 上的 class 会被 Element Plus 转交给内层 `el-input`，写在 `.audit-submit__page` 上的 `flex: 2`
 从来没命中真正的 flex 子项，页面路径列固定撑到 368px、同排 query 输入框被挤到 22px；改成从行容器 `:deep(.el-autocomplete)` 命中根节点
 （`flex: 2` + `min-width: 0`）后实测变成 260 : 130。
+
+改名与头像这一轮补了 12 例（后端 189 例全绿，原 177 + 12）。头像的失败**不是**图片超限：`multipartUploadSendsContentLength`
+断言出站请求头里 `Transfer-Encoding` 为 null、`Content-Length` 等于实际 body 字节数，同时校验 boundary 出现在 body 首尾、
+`Content-Disposition: form-data; name="media"; filename="avatar.png"` 与 `Content-Type: image/png` 都在。
+这个缺陷能活到生产，是因为 `MockWeChatServer` 和本机桩对 chunked 与 Content-Length 一视同仁——186 条绿灯测试全部接受 chunked，
+所以只能从请求头守住；真正定位靠的是把出站字节原样打到本地 socket 上，实测改前是 `Transfer-Encoding: chunked`、改后是
+`Content-Length: 1573062`。改名侧新增 `setNicknameBlockedForNormalRegister`（`register_type=0` 时**一个微信请求都不发**，
+错误文案指向微信公众平台）与 `basicInfoExposesApiRenameCapability`（0 → `apiRenameSupported=false`，没刷新过资料 → null 不误伤），
+`WechatApiContractTest` 把 91xxx/头像侧错误码的中文说明和「未映射码回落原文」一起锁住。
+浏览器实测（桩后端可切 `register_type`）：`register_type=0` 时改名弹窗顶部亮出「该小程序不支持通过第三方平台改名…」且「提交修改」
+按钮 `disabled`；切到 `6` 后提示消失、提交后桩收到 1 次 `PUT …/nickname`，页面只弹一条「已提交微信审核，审核单号 300001」；
+头像走 `PUT …/avatar` 同样只弹一条「头像已更新，微信侧生效可能有延迟」，不再出现重复 toast。
 
 仍只能等真实凭据与备案域名才能验证：真实 `component_appid`/`component_secret` 换取 token、出口 IP 白名单（缺失报 `40164`）、
 公网 https 备案域名的微信侧校验、已备案小程序才允许发布、宿主机 nginx 的证书链与 `/wx/` 透传（compose 已不含 caddy）。

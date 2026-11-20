@@ -88,6 +88,9 @@ const openScannedSearchText = computed(() =>
   switchText(info.value?.openScannedSearch, '已开启（可被搜索）', '已关闭')
 )
 
+/** apiRenameSupported 为 false 说明是普通方式注册，微信必定拒绝接口改名（91001）；null 是还没刷新过资料，不拦 */
+const renameBlocked = computed(() => info.value?.apiRenameSupported === false)
+
 const rawText = computed(() => (info.value?.raw ? JSON.stringify(info.value.raw) : ''))
 
 async function load(): Promise<void> {
@@ -340,8 +343,18 @@ defineExpose({ reload: load })
       title="修改小程序名称"
       confirm-text="提交修改"
       :loading="submitting"
+      :disabled="renameBlocked"
       @confirm="submitNickname"
     >
+      <el-alert
+        v-if="renameBlocked"
+        type="warning"
+        show-icon
+        :closable="false"
+        title="该小程序不支持通过第三方平台改名"
+        description="微信只允许「通过 API 注册」的小程序由第三方平台修改名称。请小程序管理员登录微信公众平台，在「设置 → 基本设置 → 名称」中申请修改。"
+        class="basic-info__check"
+      />
       <el-form ref="nicknameFormRef" :model="nicknameForm" :rules="nicknameRules" label-width="110px">
         <el-form-item label="新名称" prop="nickname">
           <el-input v-model="nicknameForm.nickname" placeholder="例如：某某市家具行业协会" maxlength="30" show-word-limit />

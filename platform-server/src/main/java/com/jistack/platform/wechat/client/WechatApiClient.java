@@ -4,18 +4,16 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
+import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
@@ -110,19 +108,71 @@ public class WechatApiClient {
 
     private JsonNode multipart(String path, Map<String, String> query, Map<String, String> fields,
                                String filePartName, String fileName, byte[] content) {
-        MultiValueMap<String, Object> form = new LinkedMultiValueMap<>();
-        fields.forEach((k, v) -> {
-            if (v != null) {
-                form.add(k, v);
+        String boundary = "----WxPlatform" + java.util.UUID.randomUUID().toString().replace("-", "");
+        ByteArrayOutputStream body = new ByteArrayOutputStream((content == null ? 0 : content.length) + 512);
+        for (Map.Entry<String, String> field : fields.entrySet()) {
+            if (field.getValue() == null) {
+                continue;
             }
-        });
-        if (content != null) {
-            form.add(filePartName, new NamedByteArrayResource(content, fileName));
+            body.writeBytes(partHead(boundary, field.getKey(), null).getBytes(StandardCharsets.UTF_8));
+            body.writeBytes(field.getValue().getBytes(StandardCharsets.UTF_8));
+            body.writeBytes(CRLF);
         }
+        if (content != null) {
+            body.writeBytes(partHead(boundary, filePartName, fileName).getBytes(StandardCharsets.UTF_8));
+            body.writeBytes(content);
+            body.writeBytes(CRLF);
+        }
+        body.writeBytes(("--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+
         HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+        headers.setContentType(new MediaType("multipart", "form-data", Map.of("boundary", boundary)));
+        headers.setContentLength(body.size());
         return exchange(path, url(path, query), HttpMethod.POST,
-                new HttpEntity<>(form, headers), "POST(multipart) " + path);
+                new HttpEntity<>(body.toByteArray(), headers), "POST(multipart) " + path);
+    }
+
+    private static final byte[] CRLF = {'\r', '\n'};
+
+    /** 文件部分带上文件名与内容类型，微信按后缀判断素材类型。 */
+    private static String partHead(String boundary, String name, String fileName) {
+        StringBuilder head = new StringBuilder()
+                .append("--").append(boundary).append("\r\n")
+                .append("Content-Disposition: form-data; name=\"").append(safeName(name)).append("\"");
+        if (fileName != null) {
+            head.append("; filename=\"").append(safeName(fileName)).append("\"\r\n")
+                    .append("Content-Type: ").append(mediaTypeOf(fileName));
+        }
+        return head.append("\r\n\r\n").toString();
+    }
+
+    /** 文件名来自上传请求：去掉引号和换行，避免拼进 multipart 头部；非 ASCII 只保留后缀。 */
+    static String safeName(String value) {
+        String cleaned = value == null ? "" : value.replaceAll("[\"'\\r\\n\\x00\\\\]", "").trim();
+        if (cleaned.isEmpty()) {
+            return "file";
+        }
+        if (!ASCII_PRINTABLE.matcher(cleaned).matches()) {
+            int dot = cleaned.lastIndexOf('.');
+            String ext = dot >= 0 && dot < cleaned.length() - 1
+                    ? cleaned.substring(dot + 1).replaceAll("[^A-Za-z0-9]", "") : "";
+            return ext.isEmpty() ? "file" : "file." + ext;
+        }
+        return cleaned.length() > 128 ? cleaned.substring(cleaned.length() - 128) : cleaned;
+    }
+
+    private static final java.util.regex.Pattern ASCII_PRINTABLE = java.util.regex.Pattern.compile("[\\x20-\\x7E]+");
+
+    private static String mediaTypeOf(String fileName) {
+        String lower = fileName.toLowerCase(java.util.Locale.ROOT);
+        return switch (lower.substring(lower.lastIndexOf('.') + 1)) {
+            case "png" -> "image/png";
+            case "jpg", "jpeg" -> "image/jpeg";
+            case "gif" -> "image/gif";
+            case "bmp" -> "image/bmp";
+            case "mp4" -> "video/mp4";
+            default -> "application/octet-stream";
+        };
     }
 
     public byte[] getBinary(String path, String accessToken) {
@@ -216,7 +266,15 @@ public class WechatApiClient {
                 errcode = node.path("ErrCode");
                 errmsg = node.path("ErrMsg").asText("");
             }
-            throw new WechatApiException(errcode.asInt(), errmsg.isBlank() ? errmsgOf(errcode.asInt()) : errmsg, path);
+            int code = errcode.asInt();
+            // 微信的 errmsg 多是英文短句，界面要的是下一步该做什么；原始文本留在日志里
+            String hint = errmsgOf(code);
+            if (hint == null) {
+                hint = errmsg.isBlank() ? "接口返回错误" : errmsg;
+            } else if (!errmsg.isBlank() && !errmsg.equals(hint)) {
+                log.warn("{} 微信原始 errmsg: [{}] {}", path, code, errmsg);
+            }
+            throw new WechatApiException(code, hint, path);
         }
     }
 
@@ -258,22 +316,24 @@ public class WechatApiClient {
             case 86001 -> "小程序尚未上传代码";
             case 86002 -> "小程序未设置名称/头像/简介，请先完善基本信息";
             case 89501, 89502, 89503, 89504 -> "需小程序管理员确认或流程处理中，请稍后重试";
-            default -> "接口返回错误";
+            case 40004 -> "素材类型不合法，图片只支持 PNG、JPG、GIF、BMP";
+            case 40007 -> "media_id 无效：素材必须用该小程序的授权令牌上传，且临时素材只保存 3 天";
+            case 40009 -> "图片尺寸太大，请压缩后重试";
+            case 46001 -> "素材不存在或已过期：临时素材只保存 3 天，请重新上传";
+            case 53202 -> "本月头像修改次数已用完，下月 1 日恢复";
+            case 91001 -> "该小程序不是通过第三方平台 API 注册的，微信不允许接口改名；"
+                    + "请小程序管理员登录微信公众平台，在「设置 → 基本设置 → 名称」中修改";
+            case 91003 -> "改名状态不合法，请稍后重试";
+            case 91004 -> "名称不合法，不能包含「小程序」等关键字";
+            case 91005 -> "名称受 15 天主体保护，暂时无法使用";
+            case 91007 -> "名称已被占用";
+            case 91008 -> "名称命中 7 天侵权保护期";
+            case 91009 -> "该名称需要提交证明材料，请上传营业执照或组织机构代码证后重试";
+            case 91013 -> "同一主体占用该名称的小程序过多";
+            case 91019 -> "小程序正在审核中，暂不能改名";
+            case 91028 -> "试用小程序不支持通过接口改名";
+            case 91029 -> "本年度改名次数已用尽，可通过发起微信认证继续改名";
+            default -> null;
         };
-    }
-
-    /** multipart 需要文件名，ByteArrayResource 默认不给。 */
-    static class NamedByteArrayResource extends ByteArrayResource {
-        private final String filename;
-
-        NamedByteArrayResource(byte[] content, String filename) {
-            super(content);
-            this.filename = filename == null ? "file" : filename;
-        }
-
-        @Override
-        public String getFilename() {
-            return filename;
-        }
     }
 }

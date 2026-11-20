@@ -168,6 +168,9 @@ public class AuthorizerWriter {
             authorizer.setOriginalUsername(info.path("user_name").asText(null));
             authorizer.setVerifyType(info.path("verify_type_info").path("id").asInt(-1));
             authorizer.setServiceType(info.path("service_type_info").path("id").asInt(0));
+            if (info.hasNonNull("register_type")) {
+                authorizer.setRegisterType(info.path("register_type").asInt());
+            }
             authorizer.setVerifyInfo(truncate(info.path("signature").asText(null), 500));
             JsonNode mini = info.path("MiniProgramInfo");
             if (!mini.isMissingNode()) {

@@ -92,7 +92,7 @@ class MockWeChatServer extends Dispatcher {
                       "qrcode_url":"https://mock.example/qr-authorizer.png",
                       "user_name":"gh_xzmock","principal_name":"某某行业协会","alias":"xzmock",
                       "signature":"服务协会会员专属入口",
-                      "service_type_info":{"id":1},"verify_type_info":{"id":-1},"business_info":[],
+                      "service_type_info":{"id":1},"verify_type_info":{"id":-1},"register_type":6,"business_info":[],
                       "MiniProgramInfo":{"current_version":"1.0.9"}},
                      "authorization_info":{"authorizer_appid":"%s",
                       "func_info":[{"funcscope_category":{"id":1}},{"funcscope_category":{"id":4}}]}}

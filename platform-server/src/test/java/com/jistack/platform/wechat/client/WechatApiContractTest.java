@@ -488,7 +488,7 @@ class WechatApiContractTest {
     }
 
     @Test
-    @DisplayName("errcode 非 0 统一转异常，并带上调用的接口路径")
+    @DisplayName("errcode 非 0 统一转异常：已知码给中文指引，未知码转述微信原文")
     void errcodeIsTurnedIntoExceptionWithApiPath() throws Exception {
         ok("{\"errcode\":48001,\"errmsg\":\"api unauthorized\"}");
 
@@ -497,7 +497,13 @@ class WechatApiContractTest {
 
         assertEquals(48001, ex.getErrcode());
         assertEquals("/wxa/get_page", ex.getApiPath());
-        assertEquals("api unauthorized", ex.getErrmsg());
+        // 微信原文多是英文短句，界面要能看出下一步做什么；原文只留在日志里
+        assertEquals("该小程序未授权对应权限集", ex.getErrmsg());
+
+        ok("{\"errcode\":85044,\"errmsg\":\"review unavailable\"}");
+        WechatApiException unknown = assertThrows(WechatApiException.class,
+                () -> MiniProgramApi.pageList(api, AUTHORIZER_TOKEN));
+        assertEquals("review unavailable", unknown.getErrmsg());
     }
 
     @Test

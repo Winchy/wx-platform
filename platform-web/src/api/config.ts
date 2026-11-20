@@ -15,6 +15,10 @@ export interface BasicInfo {
   /** 微信原始值：0/1；未配置时为 -1 */
   openVerify: number | null
   openScannedSearch: number | null
+  /** 微信 register_type：0 普通方式注册，非 0 才是通过 API 注册；未刷新授权资料时为 null */
+  registerType: number | null
+  /** 微信只允许「通过 API 注册」的小程序由第三方平台改名（否则 91001）；null 表示未知 */
+  apiRenameSupported: boolean | null
   /** getaccountbasicinfo 原样返回，便于排查字段缺失 */
   raw: Record<string, unknown> | null
 }

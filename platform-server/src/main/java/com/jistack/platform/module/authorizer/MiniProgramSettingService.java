@@ -44,8 +44,8 @@ public class MiniProgramSettingService {
             "udp", "udp",
             "tcp", "tcp");
 
-    /** 微信文档对头像图片的限制：不超过 2M，格式 PNG/JPG/JPEG/GIF/BMP。 */
-    private static final int MAX_AVATAR_BYTES = 2 * 1024 * 1024;
+    /** 微信文档对图片类临时素材的限制：不超过 2M，格式 PNG/JPG/JPEG/GIF/BMP（头像与改名材料共用）。 */
+    private static final int MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 
     private final WechatCaller caller;
     private final AuthorizerWriter authorizerWriter;
@@ -78,8 +78,21 @@ public class MiniProgramSettingService {
         result.put("principalName", orText(account.path("principal_name").asText(null), authorizer.getPrincipalName()));
         result.put("openVerify", verifyFlag(account, authorizer.getVerifyType()));
         result.put("openScannedSearch", account.path("open_scanned_search").asInt(-1));
+        result.put("registerType", authorizer.getRegisterType());
+        // 微信 91001：只有「通过 API 注册」的小程序能用 setnickname 改名；未刷新过资料时给 null，界面不拦
+        result.put("apiRenameSupported", authorizer.getRegisterType() == null
+                ? null : authorizer.getRegisterType() != 0);
         result.put("raw", account);
         return result;
+    }
+
+    /** 普通方式注册的小程序微信不允许接口改名（91001），提前拦下，别让管理员空等一次调用。 */
+    private void requireApiRenameSupported(String appid) {
+        Integer registerType = authorizerWriter.require(appid).getRegisterType();
+        if (registerType != null && registerType == 0) {
+            throw new BizException("该小程序是普通方式注册（非第三方平台 API 注册），微信不允许通过接口改名；"
+                    + "请小程序管理员登录微信公众平台，在「设置 → 基本设置 → 名称」中修改");
+        }
     }
 
     /** 认证状态：新版是 wx_verify_info 的两个布尔，老版是 open_verify，都没有时沿用授权方信息里的 verify_type。 */
@@ -118,6 +131,7 @@ public class MiniProgramSettingService {
     public Map<String, Object> setNickname(String appid, String nickname, String idCard, String license,
                                            List<String> namingOtherStuff) {
         requireText(nickname, "小程序名称");
+        requireApiRenameSupported(appid);
         List<String> stuff = namingOtherStuff == null ? List.of() : namingOtherStuff.stream()
                 .filter(StringUtils::hasText)
                 .map(String::trim)
@@ -141,6 +155,9 @@ public class MiniProgramSettingService {
     public String uploadNicknameMaterial(String appid, String filename, byte[] content) {
         if (content == null || content.length == 0) {
             throw new BizException("请选择要上传的材料图片");
+        }
+        if (content.length > MAX_IMAGE_BYTES) {
+            throw new BizException("材料图片不能超过 2M，当前 " + (content.length / 1024) + "K，请先压缩");
         }
         JsonNode node = caller.authorizer(appid, "mediaupload",
                 (api, token) -> MiniProgramApi.uploadTempMedia(api, token,
@@ -174,7 +191,7 @@ public class MiniProgramSettingService {
         if (image == null || image.length == 0) {
             throw new BizException("请选择要上传的头像图片");
         }
-        if (image.length > MAX_AVATAR_BYTES) {
+        if (image.length > MAX_IMAGE_BYTES) {
             throw new BizException("头像图片不能超过 2M，当前 " + (image.length / 1024) + "K，请先压缩或裁成正方形");
         }
         String format = imageFormat(image);

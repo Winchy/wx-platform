@@ -27,6 +27,8 @@ public class Authorizer {
     private String originalUsername;
     private Integer verifyType;
     private Integer serviceType;
+    /** 小程序注册方式（api_get_authorizer_info）：0 普通方式注册，非 0 才是通过 API 注册。 */
+    private Integer registerType;
     private String funcInfoJson;
     private String refreshTokenEnc;
     private LocalDateTime tokenExpiredAt;

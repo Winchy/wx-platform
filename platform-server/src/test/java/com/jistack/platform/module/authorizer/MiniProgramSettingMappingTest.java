@@ -245,6 +245,32 @@ class MiniProgramSettingMappingTest {
     }
 
     @Test
+    @DisplayName("multipart 出站必须带 Content-Length：chunked 会被微信中途断连")
+    void multipartUploadSendsContentLength() throws Exception {
+        ok("{\"errcode\":0,\"media_id\":\"MEDIA_AVATAR\"}");
+        ok("{\"errcode\":0,\"errmsg\":\"ok\"}");
+
+        service.setAvatar(APPID, pngBytes(), null, null, null, null, null);
+
+        RecordedRequest upload = take();
+        // MockWebServer 对 chunked 和 Content-Length 都能收，所以只能从请求头断言：
+        // Spring 的 MultiValueMap 写法实测发 Transfer-Encoding: chunked，微信直接中途断连接。
+        assertThat(upload.getHeader("Transfer-Encoding")).isNull();
+        assertThat(upload.getHeader("Content-Length")).isNotNull();
+        assertThat(upload.getHeader("Content-Length")).isEqualTo(String.valueOf(upload.getBodySize()));
+        String contentType = upload.getHeader("Content-Type");
+        assertThat(contentType).startsWith("multipart/form-data;boundary=");
+        String boundary = contentType.substring(contentType.indexOf("boundary=") + "boundary=".length());
+        String body = upload.getBody().readUtf8();
+        assertThat(body).startsWith("--" + boundary)
+                .contains("Content-Disposition: form-data; name=\"media\"; filename=\"avatar.png\"")
+                .contains("Content-Type: image/png")
+                .endsWith("--" + boundary + "--\r\n");
+
+        take(); // modifyheadimage
+    }
+
+    @Test
     @DisplayName("文件名后缀骗人时按文件真实内容改名，不会把 .webp 发给微信")
     void setAvatarRenamesMismatchedExtension() throws Exception {
         ok("{\"errcode\":0,\"media_id\":\"MEDIA_AVATAR\"}");
@@ -473,6 +499,51 @@ class MiniProgramSettingMappingTest {
                 .hasMessageContaining("最多 5 份");
 
         assertThat(server.getRequestCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("普通方式注册的小程序不发起改名：微信只会回 91001 not fast register")
+    void setNicknameBlockedForNormalRegister() {
+        Authorizer normal = new Authorizer();
+        normal.setRegisterType(0);
+        when(writer.require(anyString())).thenReturn(normal);
+
+        assertThatThrownBy(() -> service.setNickname(APPID, "某某家具协会", null, null, List.of()))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("微信公众平台");
+        assertThat(server.getRequestCount()).isZero();
+
+        Authorizer byApi = new Authorizer();
+        byApi.setRegisterType(6);
+        when(writer.require(anyString())).thenReturn(byApi);
+        assertThatThrownBy(() -> service.setNickname(APPID, "某某家具协会", null, null,
+                List.of("M1", "M2", "M3", "M4", "M5", "M6")))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("最多 5 份");
+    }
+
+    @Test
+    @DisplayName("基本信息给出注册方式与能否接口改名，未刷新资料时不误判")
+    void basicInfoExposesApiRenameCapability() throws Exception {
+        Authorizer normal = new Authorizer();
+        normal.setRegisterType(0);
+        when(writer.require(anyString())).thenReturn(normal);
+        ok("{\"errcode\":0,\"nickname_info\":{\"nickname\":\"协会会员服务\"}}");
+
+        Map<String, Object> info = service.basicInfo(APPID);
+        take();
+
+        assertThat(info.get("registerType")).isEqualTo(0);
+        assertThat(info.get("apiRenameSupported")).isEqualTo(false);
+
+        // 没刷新过授权方资料时 register_type 为空，界面不能因此拦住改名
+        when(writer.require(anyString())).thenReturn(new Authorizer());
+        ok("{\"errcode\":0,\"nickname_info\":{\"nickname\":\"协会会员服务\"}}");
+        Map<String, Object> unknown = service.basicInfo(APPID);
+        take();
+
+        assertThat(unknown.get("registerType")).isNull();
+        assertThat(unknown.get("apiRenameSupported")).isNull();
     }
 
     @Test

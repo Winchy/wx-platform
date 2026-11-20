@@ -748,6 +748,9 @@ class PlatformEndToEndTest {
         assertThat(basic.path("userName").asText()).isEqualTo("gh_xzmock");
         assertThat(basic.path("principalName").asText()).isEqualTo("某某行业协会");
         assertThat(basic.path("openVerify").asInt()).isZero();
+        // 改名接口只对 API 注册的小程序开放，界面靠这两个字段决定要不要拦住提交
+        assertThat(basic.path("registerType").asInt()).isEqualTo(6);
+        assertThat(basic.path("apiRenameSupported").asBoolean()).isTrue();
 
         assertThat(api(HttpMethod.PUT, "/api/authorizers/" + AUTHORIZER_APPID + "/signature",
                 Map.of("signature", "服务协会会员")).path("errcode").asInt()).isZero();
