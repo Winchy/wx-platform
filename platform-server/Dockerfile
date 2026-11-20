@@ -1,9 +1,12 @@
 # 后端镜像：构建阶段用 Maven，运行阶段只留 JRE。
+# --mount=type=cache 需要 BuildKit（docker compose v2 默认开启；老构建器请删掉这处 mount 参数）。
 FROM docker.m.daocloud.io/library/maven:3.9-eclipse-temurin-21 AS build
 WORKDIR /src
-COPY pom.xml ./
+COPY pom.xml maven-settings.xml ./
 COPY src ./src
-RUN mvn -B -DskipTests package
+# /root/.m2 挂 BuildKit 缓存：改代码会让这一层失效，但依赖已在缓存里，不再重新下载
+# （只有 docker builder prune 会清掉这份缓存）。
+RUN --mount=type=cache,target=/root/.m2 mvn -B -s maven-settings.xml -DskipTests package
 
 FROM docker.m.daocloud.io/library/eclipse-temurin:21-jre-jammy
 WORKDIR /app
