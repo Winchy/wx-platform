@@ -76,6 +76,16 @@ class MiniProgramSettingMappingTest {
         return json.readTree(take().getBody().readUtf8());
     }
 
+    /** setAvatar 认文件头不认文件名，头像用例统一用这段带 PNG 签名的字节。 */
+    private byte[] pngBytes() {
+        byte[] head = {(byte) 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+        byte[] body = "fake-png-body".getBytes();
+        byte[] all = new byte[head.length + body.length];
+        System.arraycopy(head, 0, all, 0, head.length);
+        System.arraycopy(body, 0, all, head.length, body.length);
+        return all;
+    }
+
     @Test
     @DisplayName("基本信息：按文档取 signature_info / head_image_info / nickname_info")
     void basicInfoReadsNestedDocumentedFields() throws Exception {
@@ -212,15 +222,17 @@ class MiniProgramSettingMappingTest {
     }
 
     @Test
-    @DisplayName("改头像两步走：先 uploadmedia 拿 mediaid，再带比例裁剪框提交")
+    @DisplayName("改头像两步走：先走新增临时素材拿 media_id，再带比例裁剪框提交")
     void setAvatarUploadsThenCommits() throws Exception {
-        ok("{\"errcode\":0,\"mediaid\":\"MEDIA_AVATAR\"}");
+        ok("{\"errcode\":0,\"media_id\":\"MEDIA_AVATAR\"}");
         ok("{\"errcode\":0,\"errmsg\":\"ok\"}");
 
-        service.setAvatar(APPID, "pngbytes".getBytes(), null, 0.0, 0.0, 0.42, 0.42);
+        service.setAvatar(APPID, pngBytes(), null, 0.0, 0.0, 0.42, 0.42);
 
         RecordedRequest upload = take();
-        assertThat(upload.getPath()).startsWith("/wxa/uploadmedia");
+        // 文档要求头像素材来自新增临时素材：uploadmedia 拿到的 id 会被 modifyheadimage 判 40007
+        assertThat(upload.getPath()).startsWith("/cgi-bin/media/upload");
+        assertThat(upload.getPath()).contains("type=image");
         assertThat(upload.getBody().readUtf8()).contains("avatar.png");
 
         JsonNode body = json.readTree(take().getBody().readUtf8());
@@ -233,26 +245,62 @@ class MiniProgramSettingMappingTest {
     }
 
     @Test
+    @DisplayName("文件名后缀骗人时按文件真实内容改名，不会把 .webp 发给微信")
+    void setAvatarRenamesMismatchedExtension() throws Exception {
+        ok("{\"errcode\":0,\"media_id\":\"MEDIA_AVATAR\"}");
+        ok("{\"errcode\":0,\"errmsg\":\"ok\"}");
+
+        service.setAvatar(APPID, pngBytes(), "logo.webp", null, null, null, null);
+
+        String uploadBody = take().getBody().readUtf8();
+        assertThat(uploadBody).contains("avatar.png");
+        assertThat(uploadBody).doesNotContain("logo.webp");
+        // 没给裁剪框时按整图提交，四个坐标仍是必填的字符串
+        JsonNode body = json.readTree(take().getBody().readUtf8());
+        assertThat(body.path("x1").asText()).isEqualTo("0");
+        assertThat(body.path("y1").asText()).isEqualTo("0");
+        assertThat(body.path("x2").asText()).isEqualTo("1");
+        assertThat(body.path("y2").asText()).isEqualTo("1");
+    }
+
+    @Test
     @DisplayName("裁剪坐标传像素值时本地拦下，不浪费一次头像上传")
     void setAvatarRejectsPixelCrop() {
-        assertThatThrownBy(() -> service.setAvatar(APPID, "x".getBytes(), "a.png", 0.0, 0.0, 420.0, 420.0))
+        assertThatThrownBy(() -> service.setAvatar(APPID, pngBytes(), "a.png", 0.0, 0.0, 420.0, 420.0))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("0~1");
         assertThat(server.getRequestCount()).isZero();
     }
 
     @Test
-    @DisplayName("头像没选图片就不请求；上传拿不到 mediaid 时报错而不是提交空 id")
-    void setAvatarGuardsMediaId() {
+    @DisplayName("超过 2M 或内容不是微信支持的图片：本地拦下，不发微信也不占修改额度")
+    void setAvatarRejectsOversizedAndUnknownFormat() {
+        byte[] png = pngBytes();
+        byte[] tooBig = new byte[png.length + 2 * 1024 * 1024];
+        System.arraycopy(png, 0, tooBig, 0, png.length);
+        assertThatThrownBy(() -> service.setAvatar(APPID, tooBig, "big.png", null, null, null, null))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("不能超过 2M");
+
+        assertThatThrownBy(() -> service.setAvatar(APPID, "RIFFxxxxWEBPvp8 ".getBytes(), "a.webp",
+                null, null, null, null))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("只支持 PNG");
+
         assertThatThrownBy(() -> service.setAvatar(APPID, new byte[0], "a.png", null, null, null, null))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("请选择要上传的头像图片");
-        assertThat(server.getRequestCount()).isZero();
 
+        assertThat(server.getRequestCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("上传没返回 media_id 时报错，而不是提交空 id")
+    void setAvatarGuardsMediaId() {
         ok("{\"errcode\":0}");
-        assertThatThrownBy(() -> service.setAvatar(APPID, "x".getBytes(), "a.png", 0.0, 0.0, 1.0, 1.0))
+        assertThatThrownBy(() -> service.setAvatar(APPID, pngBytes(), "a.png", 0.0, 0.0, 1.0, 1.0))
                 .isInstanceOf(BizException.class)
-                .hasMessageContaining("mediaid");
+                .hasMessageContaining("media_id");
         assertThat(server.getRequestCount()).isEqualTo(1);
     }
 
@@ -380,5 +428,86 @@ class MiniProgramSettingMappingTest {
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("1（现网版本）或 2（开发版）");
         assertThat(server.getRequestCount()).isEqualTo(sent);
+    }
+
+    @Test
+    @DisplayName("改名请求体只出现文档字段：多余字段与数组值会让微信回 47001")
+    void setNicknameSendsOnlyDocumentedKeys() throws Exception {
+        ok("{\"errcode\":0,\"errmsg\":\"ok\",\"wording\":\"材料已提交\",\"audit_id\":33001}");
+
+        Map<String, Object> result = service.setNickname(APPID, "智能制造行业协会", "  ", "MEDIA_LICENSE",
+                List.of("", "MEDIA_A", "MEDIA_B"));
+
+        JsonNode body = requestBody();
+        assertThat(body.path("nick_name").asText()).isEqualTo("智能制造行业协会");
+        assertThat(body.path("license").asText()).isEqualTo("MEDIA_LICENSE");
+        // 空行被过滤后按 naming_other_stuff_1.. 连续编号，不会留出空洞
+        assertThat(body.path("naming_other_stuff_1").asText()).isEqualTo("MEDIA_A");
+        assertThat(body.path("naming_other_stuff_2").asText()).isEqualTo("MEDIA_B");
+        assertThat(body.has("naming_other_stuff_3")).isFalse();
+        assertThat(body.has("id_card")).isFalse();
+        assertThat(body.has("name_type")).isFalse();
+        assertThat(body.has("enterprise_name")).isFalse();
+        assertThat(body.has("credential_media_id")).isFalse();
+        assertThat(body.path("license").isArray()).isFalse();
+        assertThat(result).containsOnly(Map.entry("auditId", "33001"), Map.entry("wording", "材料已提交"));
+    }
+
+    @Test
+    @DisplayName("名称未命中关键词时只发 nick_name，材料字段一个都不带；没有 audit_id 就是已生效")
+    void setNicknameWithoutMaterialsSendsOnlyName() throws Exception {
+        ok("{\"errcode\":0,\"errmsg\":\"ok\",\"wording\":\"\"}");
+
+        Map<String, Object> result = service.setNickname(APPID, "某某家具协会", null, "", List.of());
+
+        assertThat(requestBody().fieldNames()).toIterable().containsExactly("nick_name");
+        assertThat(result.get("auditId")).isNull();
+    }
+
+    @Test
+    @DisplayName("其他证明材料超过 5 份本地拦下，不占用改名次数")
+    void setNicknameCapsOtherMaterials() {
+        assertThatThrownBy(() -> service.setNickname(APPID, "某某家具协会", null, null,
+                List.of("M1", "M2", "M3", "M4", "M5", "M6")))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("最多 5 份");
+
+        assertThat(server.getRequestCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("名称检测把 hit_condition/wording 翻成界面字段，不把微信原始 JSON 丢给前端")
+    void checkNicknameMapsToUiFields() throws Exception {
+        ok("{\"errcode\":0,\"errmsg\":\"ok\",\"hit_condition\":true,"
+                + "\"wording\":\"请提供可确认主体材料与名称对应的材料\"}");
+
+        Map<String, Object> hit = service.checkNickname(APPID, "智能制造行业协会");
+
+        assertThat(requestBody().path("nick_name").asText()).isEqualTo("智能制造行业协会");
+        assertThat(hit).containsOnly(Map.entry("hitCondition", true),
+                Map.entry("wording", "请提供可确认主体材料与名称对应的材料"));
+
+        ok("{\"errcode\":0,\"errmsg\":\"ok\",\"hit_condition\":false,\"wording\":\"\"}");
+        assertThat(service.checkNickname(APPID, "某某家具协会"))
+                .containsOnly(Map.entry("hitCondition", false), Map.entry("wording", ""));
+    }
+
+    @Test
+    @DisplayName("改名材料走新增临时素材：type=image 在 query 上，取回的是 media_id")
+    void nicknameMaterialUsesTempMedia() throws Exception {
+        ok("{\"errcode\":0,\"errmsg\":\"ok\",\"type\":\"image\",\"media_id\":\"MEDIA_LICENSE\"}");
+
+        assertThat(service.uploadNicknameMaterial(APPID, "license.png", new byte[]{1, 2}))
+                .isEqualTo("MEDIA_LICENSE");
+
+        RecordedRequest request = take();
+        assertThat(request.getPath()).startsWith("/cgi-bin/media/upload");
+        assertThat(request.getPath()).contains("type=image");
+        assertThat(request.getBody().readUtf8()).contains("name=\"media\"").contains("license.png");
+
+        ok("{\"errcode\":0,\"errmsg\":\"ok\"}");
+        assertThatThrownBy(() -> service.uploadNicknameMaterial(APPID, "a.png", new byte[]{1}))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("media_id");
     }
 }

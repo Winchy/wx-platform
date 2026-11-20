@@ -751,8 +751,36 @@ class PlatformEndToEndTest {
 
         assertThat(api(HttpMethod.PUT, "/api/authorizers/" + AUTHORIZER_APPID + "/signature",
                 Map.of("signature", "服务协会会员")).path("errcode").asInt()).isZero();
-        assertThat(api(HttpMethod.POST, "/api/authorizers/" + AUTHORIZER_APPID + "/nickname/check",
-                Map.of("nickname", "某某行业协会")).path("errcode").asInt()).isZero();
+        // 占用检查已映射成界面字段，不再把微信原始 JSON 抛给前端
+        JsonNode nicknameCheck = api(HttpMethod.POST, "/api/authorizers/" + AUTHORIZER_APPID + "/nickname/check",
+                Map.of("nickname", "某某行业协会"));
+        assertThat(nicknameCheck.path("hitCondition").asBoolean()).isTrue();
+        assertThat(nicknameCheck.path("wording").asText()).contains("材料");
+        assertThat(nicknameCheck.has("errcode")).isFalse();
+
+        String materialRaw = mvc.perform(MockMvcRequestBuilders
+                        .multipart("/api/authorizers/" + AUTHORIZER_APPID + "/nickname/materials")
+                        .file(new MockMultipartFile("file", "license.png", "image/png", new byte[]{1, 2, 3}))
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+        String materialId = json.readTree(materialRaw).path("data").asText();
+        assertThat(materialId).isEqualTo("MOCK_TEMP_MEDIA_ID");
+        JsonNode renamed = api(HttpMethod.PUT, "/api/authorizers/" + AUTHORIZER_APPID + "/nickname", Map.of(
+                "nickname", "某某行业协会", "license", materialId,
+                "namingOtherStuff", List.of("", "MOCK_TEMP_MEDIA_ID")));
+        assertThat(renamed.path("auditId").asText()).isEqualTo("300001");
+
+        // 头像：素材必须走新增临时素材，modifyheadimage 才认这个 media_id
+        byte[] png = {(byte) 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4};
+        String avatarRaw = mvc.perform(MockMvcRequestBuilders
+                        .multipart(HttpMethod.PUT, "/api/authorizers/" + AUTHORIZER_APPID + "/avatar")
+                        .file(new MockMultipartFile("file", "head.png", "image/png", png))
+                        .param("x1", "0").param("y1", "0").param("x2", "1").param("y2", "1")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+        assertThat(json.readTree(avatarRaw).path("data").path("errcode").asInt()).isZero();
 
         JsonNode updated = api(HttpMethod.PUT, "/api/authorizers/" + AUTHORIZER_APPID + "/domains", Map.of(
                 "action", "set", "type", "request", "domains", List.of("https://mock.example")));

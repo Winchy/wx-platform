@@ -174,6 +174,9 @@ class MockWeChatServer extends Dispatcher {
                     """);
             case "uploadmedia" -> json("errcode", 0, "errmsg", "ok", "type", "image",
                     "mediaid", "MOCK_MEDIA_ID", "created_at", 1731475400);
+            // 新增临时素材：键名是 media_id，和 uploadmedia 的 mediaid 不一样
+            case "upload" -> json("errcode", 0, "errmsg", "ok", "type", "image",
+                    "media_id", "MOCK_TEMP_MEDIA_ID", "created_at", 1731475400);
 
             // ------------------------------------------------ 小程序配置（authorizer token）
             case "modify_domain" -> flat("""
@@ -199,8 +202,12 @@ class MockWeChatServer extends Dispatcher {
                     {"errcode":0,"errmsg":"ok","category_list":[
                       {"id":"1","name":"医疗服务","levels":[1],"description":"","sensitive_auth":0}]}
                     """);
-            case "setnickname", "api_wxa_querynickname", "checkwxverifynickname",
-                 "modifysignature", "modifyheadimage" -> json("errcode", 0, "errmsg", "ok");
+            case "setnickname" -> json("errcode", 0, "errmsg", "ok", "wording", "",
+                    "audit_id", 300001);
+            case "checkwxverifynickname" -> json("errcode", 0, "errmsg", "ok", "hit_condition", true,
+                    "wording", "你申请的名称可能涉及特定主体姓名或名称，请提供可确认主体材料与名称对应的材料");
+            case "api_wxa_querynickname", "modifysignature", "modifyheadimage" ->
+                    json("errcode", 0, "errmsg", "ok");
             case "getaccountbasicinfo" -> flat("""
                     {"errcode":0,"errmsg":"ok","appid":"%s","account_type":3,"principal_type":1,
                      "principal_name":"某某行业协会","realname_status":1,"customer_type":0,

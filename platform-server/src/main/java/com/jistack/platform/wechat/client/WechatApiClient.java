@@ -12,6 +12,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
@@ -96,6 +97,19 @@ public class WechatApiClient {
     /** 代码包等 multipart 上传：普通字段 + 一个二进制文件部分。 */
     public JsonNode postMultipart(String path, String accessToken, Map<String, String> fields,
                                  String filePartName, String fileName, byte[] content) {
+        Map<String, String> query = new LinkedHashMap<>();
+        query.put("access_token", accessToken);
+        return multipart(path, query, fields, filePartName, fileName, content);
+    }
+
+    /** query 上还要带别的参数（如新增临时素材的 type=image）时用这个重载。 */
+    public JsonNode postMultipart(String path, Map<String, String> query, String filePartName,
+                                 String fileName, byte[] content) {
+        return multipart(path, query, Map.of(), filePartName, fileName, content);
+    }
+
+    private JsonNode multipart(String path, Map<String, String> query, Map<String, String> fields,
+                               String filePartName, String fileName, byte[] content) {
         MultiValueMap<String, Object> form = new LinkedMultiValueMap<>();
         fields.forEach((k, v) -> {
             if (v != null) {
@@ -107,7 +121,7 @@ public class WechatApiClient {
         }
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.MULTIPART_FORM_DATA);
-        return exchange(path, url(path, accessToken), HttpMethod.POST,
+        return exchange(path, url(path, query), HttpMethod.POST,
                 new HttpEntity<>(form, headers), "POST(multipart) " + path);
     }
 
@@ -182,6 +196,11 @@ public class WechatApiClient {
         } catch (WechatApiException ex) {
             log.warn("{} 失败 errcode={} errmsg={} cost={}ms", label, ex.getErrcode(), ex.getErrmsg(),
                     System.currentTimeMillis() - start);
+            throw ex;
+        } catch (ResourceAccessException ex) {
+            // 连接被中途断开时交给 GlobalExceptionHandler 报 502，包成 IllegalStateException 只会显示“服务器内部错误”
+            log.error("{} 与微信服务器连接中断 cost={}ms: {}", label, System.currentTimeMillis() - start,
+                    ex.getMessage());
             throw ex;
         } catch (Exception ex) {
             throw new IllegalStateException("微信接口调用失败 " + label + ": " + ex.getMessage(), ex);

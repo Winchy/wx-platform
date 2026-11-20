@@ -194,6 +194,16 @@ export function del<T>(url: string, data?: unknown, config?: AxiosRequestConfig)
 }
 
 /** multipart / form 提交 */
+export function postFormData<T>(url: string, form: FormData, config?: AxiosRequestConfig): Promise<T> {
+  return request<T>({
+    ...config,
+    url,
+    method: 'POST',
+    data: form,
+    headers: { 'Content-Type': 'multipart/form-data', ...(config?.headers ?? {}) }
+  })
+}
+
 export function putFormData<T>(url: string, form: FormData, config?: AxiosRequestConfig): Promise<T> {
   return request<T>({
     ...config,

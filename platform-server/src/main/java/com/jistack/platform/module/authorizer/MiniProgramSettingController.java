@@ -30,7 +30,9 @@ public class MiniProgramSettingController {
 
     private final MiniProgramSettingService settingService;
 
-    public record NicknameRequest(String nickname, Map<String, Object> credentials) {
+    /** idCard 个人主体必填、license 组织主体必填，都是临时素材 media_id；namingOtherStuff 最多 5 份。 */
+    public record NicknameRequest(String nickname, String idCard, String license,
+                                  List<String> namingOtherStuff) {
     }
 
     public record AuditIdRequest(String auditId) {
@@ -65,15 +67,24 @@ public class MiniProgramSettingController {
     }
 
     @PostMapping("/nickname/check")
-    public ApiResponse<JsonNode> checkNickname(@PathVariable String appid,
-                                               @RequestBody NicknameRequest request) {
+    public ApiResponse<Map<String, Object>> checkNickname(@PathVariable String appid,
+                                                          @RequestBody NicknameRequest request) {
         return ApiResponse.ok(settingService.checkNickname(appid, request.nickname()));
     }
 
     @PutMapping("/nickname")
-    public ApiResponse<JsonNode> setNickname(@PathVariable String appid,
-                                             @RequestBody NicknameRequest request) {
-        return ApiResponse.ok(settingService.setNickname(appid, request.nickname(), request.credentials()));
+    public ApiResponse<Map<String, Object>> setNickname(@PathVariable String appid,
+                                                        @RequestBody NicknameRequest request) {
+        return ApiResponse.ok(settingService.setNickname(appid, request.nickname(), request.idCard(),
+                request.license(), request.namingOtherStuff()));
+    }
+
+    /** 材料图片先换成临时素材 media_id，再填进改名请求；media_id 在微信侧只保存 3 天。 */
+    @PostMapping("/nickname/materials")
+    public ApiResponse<String> uploadNicknameMaterial(@PathVariable String appid,
+                                                      @RequestParam("file") MultipartFile file) throws IOException {
+        return ApiResponse.ok(settingService.uploadNicknameMaterial(appid, file.getOriginalFilename(),
+                file.getBytes()));
     }
 
     @GetMapping("/nickname/audit")

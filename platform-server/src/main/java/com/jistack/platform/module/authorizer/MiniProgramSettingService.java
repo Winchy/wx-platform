@@ -12,6 +12,7 @@ import org.springframework.util.StringUtils;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -42,6 +43,9 @@ public class MiniProgramSettingService {
             "download_file", "downloadFile",
             "udp", "udp",
             "tcp", "tcp");
+
+    /** 微信文档对头像图片的限制：不超过 2M，格式 PNG/JPG/JPEG/GIF/BMP。 */
+    private static final int MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 
     private final WechatCaller caller;
     private final AuthorizerWriter authorizerWriter;
@@ -96,21 +100,60 @@ public class MiniProgramSettingService {
         return -1;
     }
 
-    /** 改名前先查占用情况，避免提交后被驳回。 */
-    public JsonNode checkNickname(String appid, String nickname) {
+    /** 改名前先查是否命中关键词：命中才需要提交材料，没命中直接改名即可。 */
+    public Map<String, Object> checkNickname(String appid, String nickname) {
         requireText(nickname, "小程序名称");
-        return caller.authorizer(appid, "checkwxverifynickname",
+        JsonNode node = caller.authorizer(appid, "checkwxverifynickname",
                 (api, token) -> MiniProgramApi.checkNickname(api, token, nickname));
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("hitCondition", node.path("hit_condition").asBoolean(false));
+        result.put("wording", node.path("wording").asText(""));
+        return result;
     }
 
     /**
-     * 修改名称需要主体资质图片（先 uploadMedia 得到 mediaid），提交后进入微信审核，
-     * 返回 audit_id 供 queryNickname 轮询。
+     * 修改名称：材料是临时素材的 media_id，命中关键词却被微信判为 91009 时要补齐材料重新提交。
+     * 返回的 auditId 为空表示名称未命中关键词、已直接生效；有值则进入审核，可拿去 queryNickname 查状态。
      */
-    public JsonNode setNickname(String appid, String nickname, Map<String, Object> credentials) {
+    public Map<String, Object> setNickname(String appid, String nickname, String idCard, String license,
+                                           List<String> namingOtherStuff) {
         requireText(nickname, "小程序名称");
-        return caller.authorizer(appid, "setnickname",
-                (api, token) -> MiniProgramApi.setNickname(api, token, nickname, credentials));
+        List<String> stuff = namingOtherStuff == null ? List.of() : namingOtherStuff.stream()
+                .filter(StringUtils::hasText)
+                .map(String::trim)
+                .toList();
+        if (stuff.size() > MiniProgramApi.NAMING_OTHER_STUFF_MAX) {
+            throw new BizException("其他证明材料最多 " + MiniProgramApi.NAMING_OTHER_STUFF_MAX + " 份");
+        }
+        MiniProgramApi.NicknameMaterials materials =
+                new MiniProgramApi.NicknameMaterials(trimToNull(idCard), trimToNull(license), stuff);
+        JsonNode node = caller.authorizer(appid, "setnickname",
+                (api, token) -> MiniProgramApi.setNickname(api, token, nickname, materials));
+        // 微信只在需要审核时给 audit_id，缺省即已直接生效
+        JsonNode auditId = node.path("audit_id");
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("auditId", auditId.isValueNode() && !auditId.isNull() ? auditId.asText() : null);
+        result.put("wording", node.path("wording").asText(""));
+        return result;
+    }
+
+    /** 材料图片先传成临时素材换 media_id，界面拿它填进身份证/营业执照等字段。 */
+    public String uploadNicknameMaterial(String appid, String filename, byte[] content) {
+        if (content == null || content.length == 0) {
+            throw new BizException("请选择要上传的材料图片");
+        }
+        JsonNode node = caller.authorizer(appid, "mediaupload",
+                (api, token) -> MiniProgramApi.uploadTempMedia(api, token,
+                        StringUtils.hasText(filename) ? filename : "material.png", content));
+        String mediaId = node.path("media_id").asText(null);
+        if (!StringUtils.hasText(mediaId)) {
+            throw new BizException(502, "材料上传未返回 media_id");
+        }
+        return mediaId;
+    }
+
+    private static String trimToNull(String value) {
+        return StringUtils.hasText(value) ? value.trim() : null;
     }
 
     public JsonNode queryNickname(String appid, String auditId) {
@@ -125,24 +168,31 @@ public class MiniProgramSettingService {
                 (api, token) -> MiniProgramApi.modifySignature(api, token, signature));
     }
 
-    /** 头像：图片先上传拿 mediaid，再按裁剪框提交。裁剪框是 0~1 的比例坐标，留空表示整图裁剪。 */
+    /** 头像：图片先上传拿 media_id，再按裁剪框提交。裁剪框是 0~1 的比例坐标，留空表示整图裁剪。 */
     public JsonNode setAvatar(String appid, byte[] image, String filename,
                               Double x1, Double y1, Double x2, Double y2) {
         if (image == null || image.length == 0) {
             throw new BizException("请选择要上传的头像图片");
         }
+        if (image.length > MAX_AVATAR_BYTES) {
+            throw new BizException("头像图片不能超过 2M，当前 " + (image.length / 1024) + "K，请先压缩或裁成正方形");
+        }
+        String format = imageFormat(image);
+        if (format == null) {
+            throw new BizException("头像只支持 PNG、JPG、GIF、BMP 图片（按文件内容判断），WebP/HEIC 请先转成 JPG 或 PNG");
+        }
+        String name = avatarFilename(filename, format);
         String[] crop = {
                 x1 == null ? "0" : ratio(x1, "x1"),
                 y1 == null ? "0" : ratio(y1, "y1"),
                 x2 == null ? "1" : ratio(x2, "x2"),
                 y2 == null ? "1" : ratio(y2, "y2")
         };
-        String mediaId = caller.authorizer(appid, "uploadmedia",
-                (api, token) -> MiniProgramApi.uploadMedia(api, token,
-                        StringUtils.hasText(filename) ? filename : "avatar.png", image))
-                .path("mediaid").asText(null);
+        String mediaId = caller.authorizer(appid, "mediaupload",
+                (api, token) -> MiniProgramApi.uploadTempMedia(api, token, name, image))
+                .path("media_id").asText(null);
         if (!StringUtils.hasText(mediaId)) {
-            throw new BizException(502, "头像上传未返回 mediaid");
+            throw new BizException(502, "头像上传未返回 media_id");
         }
         return caller.authorizer(appid, "modifyheadimage",
                 (api, token) -> MiniProgramApi.modifyHeadImage(api, token, mediaId,
@@ -155,6 +205,33 @@ public class MiniProgramSettingService {
             throw new BizException("裁剪坐标 " + name + " 需为 0~1 的比例值，当前 " + value);
         }
         return java.math.BigDecimal.valueOf(value).stripTrailingZeros().toPlainString();
+    }
+
+    /** 微信按文件内容判断素材类型，不看本地文件名：这里用文件头识别，认不出就拒掉（WebP/HEIC/非图片）。 */
+    private static String imageFormat(byte[] image) {
+        if (image.length > 4 && (image[0] & 0xFF) == 0x89 && image[1] == 'P' && image[2] == 'N' && image[3] == 'G') {
+            return "png";
+        }
+        if (image.length > 2 && (image[0] & 0xFF) == 0xFF && (image[1] & 0xFF) == 0xD8) {
+            return "jpg";
+        }
+        if (image.length > 3 && image[0] == 'G' && image[1] == 'I' && image[2] == 'F' && image[3] == '8') {
+            return "gif";
+        }
+        if (image.length > 2 && image[0] == 'B' && image[1] == 'M') {
+            return "bmp";
+        }
+        return null;
+    }
+
+    /** multipart 的文件名会当作素材类型发给微信，后缀与真实格式不符（或没有后缀）时按真实格式改名。 */
+    private static String avatarFilename(String filename, String format) {
+        String name = StringUtils.hasText(filename) ? filename.trim() : "";
+        int dot = name.lastIndexOf('.');
+        String suffix = dot < 0 ? "" : name.substring(dot + 1).toLowerCase(Locale.ROOT);
+        boolean jpg = "jpg".equals(format) || "jpeg".equals(format);
+        boolean matched = suffix.equals(format) || (jpg && ("jpg".equals(suffix) || "jpeg".equals(suffix)));
+        return matched ? name : "avatar." + format;
     }
 
     // -------------------------------------------------- 域名

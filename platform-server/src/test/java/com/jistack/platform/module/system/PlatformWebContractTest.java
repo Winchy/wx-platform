@@ -21,6 +21,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.http.MediaType;
+import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
@@ -34,6 +35,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
@@ -208,6 +210,37 @@ class PlatformWebContractTest {
         verify(settingService).updatePrivacySetting("wx1", 2,
                 List.of(Map.of("privacy_key", "UserInfo", "privacy_text", "用来展示会员昵称与头像")),
                 Map.of("notice_method", "弹窗", "contact_email", "privacy@example.org"));
+    }
+
+    @Test
+    @DisplayName("改名路由：驼峰请求体绑得上，占用检查只回 hitCondition/wording")
+    void nicknameRoutes() throws Exception {
+        when(settingService.setNickname(eq("wx1"), eq("智能制造行业协会"), eq("MEDIA_ID"), eq("MEDIA_LICENSE"),
+                eq(List.of("MEDIA_A"))))
+                .thenReturn(Map.of("auditId", "33001", "wording", ""));
+        when(settingService.checkNickname("wx1", "智能制造行业协会"))
+                .thenReturn(Map.<String, Object>of("hitCondition", true, "wording", "请提供可确认主体的材料"));
+
+        mvc.perform(put("/api/authorizers/wx1/nickname").contentType(MediaType.APPLICATION_JSON).content("""
+                {"nickname":"智能制造行业协会","idCard":"MEDIA_ID","license":"MEDIA_LICENSE",
+                 "namingOtherStuff":["MEDIA_A"]}
+                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.auditId").value("33001"));
+
+        mvc.perform(post("/api/authorizers/wx1/nickname/check").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"nickname\":\"智能制造行业协会\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.hitCondition").value(true))
+                .andExpect(jsonPath("$.data.errcode").doesNotExist());
+
+        // 材料上传的 multipart 字段名前端写死为 file，改了就在这儿断掉
+        when(settingService.uploadNicknameMaterial(eq("wx1"), eq("license.png"), any()))
+                .thenReturn("MEDIA_LICENSE");
+        mvc.perform(multipart("/api/authorizers/wx1/nickname/materials")
+                        .file(new MockMultipartFile("file", "license.png", "image/png", new byte[]{1, 2})))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data").value("MEDIA_LICENSE"));
     }
 
     @Test

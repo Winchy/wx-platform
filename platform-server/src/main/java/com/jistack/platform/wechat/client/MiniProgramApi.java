@@ -29,7 +29,10 @@ public final class MiniProgramApi {
     public static final String GET_VERSION_INFO = "/wxa/getversioninfo";
     public static final String GET_VISIT_STATUS = "/wxa/getvisitstatus";
     public static final String CHANGE_VISIT_STATUS = "/wxa/change_visitstatus";
+    /** 上传提审素材（页面截图 / 录屏，权限集 18）：返回 {@code mediaid}，只能用在提审的 preview_info 里。 */
     public static final String UPLOAD_MEDIA = "/wxa/uploadmedia";
+    /** 新增临时素材：改名资质材料用的 media_id 来自这里，3 天后失效 */
+    public static final String UPLOAD_TEMP_MEDIA = "/cgi-bin/media/upload";
     public static final String GET_MATERIAL = "/cgi-bin/material/get_material";
 
     // 模板库 / 草稿箱（平台级资源，用 component_access_token）
@@ -54,6 +57,10 @@ public final class MiniProgramApi {
     public static final String SET_NICKNAME = "/wxa/setnickname";
     public static final String QUERY_NICKNAME = "/wxa/api_wxa_querynickname";
     public static final String CHECK_NICKNAME = "/cgi-bin/wxverify/checkwxverifynickname";
+    /** 改名材料都是图片，新增临时素材的 type 取值 */
+    public static final String TEMP_MEDIA_TYPE_IMAGE = "image";
+    /** naming_other_stuff_1..5，微信只给 5 个槽位 */
+    public static final int NAMING_OTHER_STUFF_MAX = 5;
     public static final String MODIFY_SIGNATURE = "/cgi-bin/account/modifysignature";
     public static final String MODIFY_HEAD_IMAGE = "/cgi-bin/account/modifyheadimage";
     public static final String GET_ACCOUNT_BASIC_INFO = "/cgi-bin/account/getaccountbasicinfo";
@@ -92,6 +99,7 @@ public final class MiniProgramApi {
         index.put("revertcoderelease", REVERT_CODE_RELEASE);
         index.put("revertcoderelease?get_history_version", REVERT_CODE_RELEASE);
         index.put("uploadmedia", UPLOAD_MEDIA);
+        index.put("mediaupload", UPLOAD_TEMP_MEDIA);
         index.put("get_material", GET_MATERIAL);
         index.put("modify_domain", MODIFY_DOMAIN);
         index.put("setwebviewdomain", SET_WEBVIEW_DOMAIN);
@@ -390,15 +398,38 @@ public final class MiniProgramApi {
 
     // -------------------------------------------------- 基本信息
 
-    /** 改名称需要主体资质材料，成功后返回 audit_id，需轮询 queryNickname。 */
+    /**
+     * 改名材料：全部是「新增临时素材」换来的 media_id。
+     *
+     * <p>微信 /wxa/setnickname 只认 {@code nick_name}、{@code id_card}、{@code license}、
+     * {@code naming_other_stuff_1..5} 这几个键，且值必须是字符串：多发字段或把多个 media_id
+     * 拼成数组都会被判成 47001 data format error。
+     */
+    public record NicknameMaterials(String idCard, String license, List<String> namingOtherStuff) {
+    }
+
+    /** 名称未命中关键词时可以只传 nick_name；命中后按主体类型补 id_card（个人）或 license（组织）。 */
     public static JsonNode setNickname(WechatApiClient api, String authorizerToken, String nickname,
-                                      Map<String, Object> credentials) {
+                                       NicknameMaterials materials) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("nick_name", nickname);
-        if (credentials != null) {
-            body.putAll(credentials);
+        if (materials != null) {
+            putIfHasText(body, "id_card", materials.idCard());
+            putIfHasText(body, "license", materials.license());
+            List<String> stuff = materials.namingOtherStuff();
+            if (stuff != null) {
+                for (int i = 0; i < stuff.size(); i++) {
+                    putIfHasText(body, "naming_other_stuff_" + (i + 1), stuff.get(i));
+                }
+            }
         }
         return api.post(SET_NICKNAME, authorizerToken, body);
+    }
+
+    private static void putIfHasText(Map<String, Object> body, String key, String value) {
+        if (value != null && !value.isBlank()) {
+            body.put(key, value);
+        }
     }
 
     public static JsonNode checkNickname(WechatApiClient api, String authorizerToken, String nickname) {
@@ -414,7 +445,8 @@ public final class MiniProgramApi {
     }
 
     /**
-     * 头像要先 uploadMedia 换 mediaid。x1y1x2y2 是裁剪框的比例坐标（取值 [0, 1]），
+     * 头像的 head_img_media_id 必须来自「新增临时素材」，且那份 media_id 要用 authorizer_access_token
+     * 取（文档明确：别的令牌取来的都会报 40007）。x1y1x2y2 是裁剪框的比例坐标（取值 [0, 1]），
      * 文档要求发成字符串，整数像素值会被微信拒绝。
      */
     public static JsonNode modifyHeadImage(WechatApiClient api, String authorizerToken, String headImgMediaId,
@@ -432,9 +464,19 @@ public final class MiniProgramApi {
         return api.get(GET_ACCOUNT_BASIC_INFO, authorizerToken);
     }
 
-    /** 审核/改名素材上传，multipart 字段名固定为 media。 */
+    /** 提审素材上传（截图 / 录屏），multipart 字段名固定为 media。 */
     public static JsonNode uploadMedia(WechatApiClient api, String authorizerToken, String filename, byte[] content) {
         return api.postMultipart(UPLOAD_MEDIA, authorizerToken, Map.of(), "media", filename, content);
+    }
+
+    /**
+     * 新增临时素材：改名材料走这个接口，返回的是 {@code media_id}（{@link #UPLOAD_MEDIA} 返回的是
+     * {@code mediaid}，两者键名不同）。type 在 query 上，文件部分名固定 media。
+     */
+    public static JsonNode uploadTempMedia(WechatApiClient api, String authorizerToken, String filename,
+                                           byte[] content) {
+        return api.postMultipart(UPLOAD_TEMP_MEDIA,
+                Map.of("access_token", authorizerToken, "type", TEMP_MEDIA_TYPE_IMAGE), "media", filename, content);
     }
 
     // -------------------------------------------------- 体验成员

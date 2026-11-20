@@ -25,9 +25,10 @@ const lockedAppid = ref(typeof route.query.appid === 'string' ? route.query.appi
 
 /** 微信文档里本站会用到的权限集；列表外的 id 可以手输 */
 const SCOPE_OPTIONS = [
-  { id: 18, label: '18 · 小程序代码提交 / 审核 / 发布' },
+  { id: 18, label: '18 · 小程序代码提交 / 审核 / 发布、服务器与业务域名' },
+  { id: 30, label: '30 · 小程序名称 / 头像 / 简介等基本信息' },
+  { id: 3, label: '3 · 基本信息读取与名称检测' },
   { id: 1, label: '1 · 小程序开发与管理' },
-  { id: 3, label: '3 · 服务器域名 / 业务域名配置' },
   { id: 4, label: '4 · 小程序基本信息设置' },
   { id: 17, label: '17 · 小程序类目管理' }
 ]

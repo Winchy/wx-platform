@@ -1,5 +1,8 @@
 import type { JsonNode } from '@/api/types'
-import { del, get, post, put, putFormData } from '@/utils/request'
+import { del, get, post, postFormData, put, putFormData } from '@/utils/request'
+
+/** 改名相关的错误由页面自己内联展示或带上下文提示，不再让拦截器重复弹一次 toast */
+const SILENT = { silent: true } as const
 
 /* ---------------- 基本信息 ---------------- */
 
@@ -16,10 +19,25 @@ export interface BasicInfo {
   raw: Record<string, unknown> | null
 }
 
-/** credentials 直接透传给微信（如企业名、组织机构代码等资质字段） */
+/** 名称检测：只有命中关键词（hitCondition）才需要提交资质材料 */
+export interface NicknameCheckResult {
+  hitCondition: boolean
+  wording: string
+}
+
+/** 材料都是「新增临时素材」换来的 media_id：个人主体填 idCard，组织主体（协会/企业）填 license */
 export interface NicknameUpdateParams {
   nickname: string
-  credentials?: Record<string, unknown>
+  idCard?: string
+  license?: string
+  /** 对应微信的 naming_other_stuff_1..5，最多 5 份 */
+  namingOtherStuff?: string[]
+}
+
+/** 微信只在需要审核时返回 auditId；为空说明名称已直接生效 */
+export interface NicknameUpdateResult {
+  auditId: string | null
+  wording: string
 }
 
 export interface SignatureUpdateParams {
@@ -136,16 +154,28 @@ export function getBasicInfo(appid: string): Promise<BasicInfo> {
   return get<BasicInfo>(`/authorizers/${appid}/basic-info`)
 }
 
-/** 改名前先查占用情况 */
-export function checkNickname(appid: string, nickname: string): Promise<JsonNode> {
-  return post<JsonNode>(`/authorizers/${appid}/nickname/check`, { nickname })
+/** 改名前先检测名称是否命中关键词 */
+export function checkNickname(appid: string, nickname: string): Promise<NicknameCheckResult> {
+  return post<NicknameCheckResult>(`/authorizers/${appid}/nickname/check`, { nickname }, SILENT)
 }
 
-export function updateNickname(appid: string, params: NicknameUpdateParams): Promise<JsonNode> {
-  return put<JsonNode>(`/authorizers/${appid}/nickname`, {
+export function updateNickname(
+  appid: string,
+  params: NicknameUpdateParams
+): Promise<NicknameUpdateResult> {
+  return put<NicknameUpdateResult>(`/authorizers/${appid}/nickname`, {
     nickname: params.nickname,
-    credentials: params.credentials ?? {}
-  })
+    idCard: params.idCard ?? '',
+    license: params.license ?? '',
+    namingOtherStuff: params.namingOtherStuff ?? []
+  }, SILENT)
+}
+
+/** 资质材料图片先换成临时素材 media_id，微信侧只保存 3 天 */
+export function uploadNicknameMaterial(appid: string, file: File): Promise<string> {
+  const form = new FormData()
+  form.append('file', file, file.name)
+  return postFormData<string>(`/authorizers/${appid}/nickname/materials`, form, SILENT)
 }
 
 export function queryNicknameAudit(appid: string, auditId: string): Promise<JsonNode> {
@@ -171,7 +201,7 @@ export function updateAvatar(
       if (typeof value === 'number') params[key] = value
     }
   }
-  return putFormData<JsonNode>(`/authorizers/${appid}/avatar`, form, { params })
+  return putFormData<JsonNode>(`/authorizers/${appid}/avatar`, form, { params, ...SILENT })
 }
 
 export function getServerDomains(appid: string): Promise<DomainConfig> {

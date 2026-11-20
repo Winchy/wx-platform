@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, type FormInstance, type FormRules, type UploadRequestHandler } from 'element-plus'
-import { Check, CircleCheck, Edit, Picture, Upload } from '@element-plus/icons-vue'
+import { Check, CircleCheck, Delete, Edit, Picture, Plus, Upload } from '@element-plus/icons-vue'
 
 import {
   checkNickname,
@@ -9,7 +9,9 @@ import {
   updateAvatar,
   updateNickname,
   updateSignature,
-  type BasicInfo
+  uploadNicknameMaterial,
+  type BasicInfo,
+  type NicknameCheckResult
 } from '@/api/config'
 import { EmptyState, FormDialog, JsonBlock } from '@/components'
 import { copyToClipboard, displayValue } from '@/utils/format'
@@ -25,24 +27,24 @@ const nicknameDialog = ref(false)
 const signatureDialog = ref(false)
 const submitting = ref(false)
 const checking = ref(false)
-const checkResult = ref('')
+const uploading = ref(false)
+const checkResult = ref<NicknameCheckResult | null>(null)
+const checkError = ref('')
 
 const nicknameFormRef = ref<FormInstance>()
 const signatureFormRef = ref<FormInstance>()
 
-/** credentials 会被后端原样合并进微信 setnickname 请求体 */
+/** 材料填的都是新增临时素材返回的 media_id，微信侧 3 天后失效 */
 const nicknameForm = reactive<{
   nickname: string
-  nameType: number | undefined
-  credentialText: string
-  enterpriseName: string
-  orgName: string
+  idCard: string
+  license: string
+  otherStuff: string[]
 }>({
   nickname: '',
-  nameType: undefined,
-  credentialText: '',
-  enterpriseName: '',
-  orgName: ''
+  idCard: '',
+  license: '',
+  otherStuff: []
 })
 
 const signatureForm = reactive<{ signature: string }>({ signature: '' })
@@ -61,28 +63,19 @@ const signatureRules: FormRules = {
   ]
 }
 
-const nameTypeOptions = [
-  { value: 1, label: '公众号/小程序名称（需资质材料）' },
-  { value: 2, label: '企业简称' },
-  { value: 3, label: '商标名称' },
-  { value: 4, label: '平台名称（协会/商会等）' }
-]
+/** 微信只给 naming_other_stuff_1..5 五个槽位 */
+const OTHER_STUFF_MAX = 5
 
-const credentialIds = computed(() =>
-  nicknameForm.credentialText
-    .split(/[,，\s]+/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-)
-
-const credentialsPayload = computed<Record<string, unknown>>(() => {
-  const payload: Record<string, unknown> = {}
-  if (nicknameForm.nameType !== undefined) payload.name_type = nicknameForm.nameType
-  if (nicknameForm.enterpriseName.trim()) payload.enterprise_name = nicknameForm.enterpriseName.trim()
-  if (nicknameForm.orgName.trim()) payload.org_name = nicknameForm.orgName.trim()
-  if (credentialIds.value.length) payload.credential_media_id = credentialIds.value
-  return payload
+const checkSummary = computed(() => {
+  if (!checkResult.value) return ''
+  return checkResult.value.hitCondition
+    ? '命中关键词：需要提交资质材料，材料齐全后进入微信审核'
+    : '未命中关键词：无需资质材料，可直接提交改名'
 })
+
+const checkTone = computed<'warning' | 'success'>(() =>
+  checkResult.value?.hitCondition ? 'warning' : 'success'
+)
 
 /** open_verify / open_scanned_search：微信返回 -1 表示资料未完善 */
 function switchText(value: number | null | undefined, on: string, off: string): string {
@@ -112,11 +105,11 @@ async function load(): Promise<void> {
 
 function openNicknameDialog(): void {
   nicknameForm.nickname = info.value?.nickname ?? ''
-  nicknameForm.credentialText = ''
-  nicknameForm.nameType = undefined
-  nicknameForm.enterpriseName = ''
-  nicknameForm.orgName = ''
-  checkResult.value = ''
+  nicknameForm.idCard = ''
+  nicknameForm.license = ''
+  nicknameForm.otherStuff = []
+  checkResult.value = null
+  checkError.value = ''
   nicknameDialog.value = true
 }
 
@@ -132,13 +125,35 @@ async function onCheckNickname(): Promise<void> {
     return
   }
   checking.value = true
+  checkError.value = ''
   try {
-    const result = await checkNickname(props.appid, nickname)
-    checkResult.value = typeof result === 'string' ? result : JSON.stringify(result ?? {})
+    checkResult.value = await checkNickname(props.appid, nickname)
   } catch (error) {
-    checkResult.value = describeError(error)
+    checkResult.value = null
+    checkError.value = describeError(error)
   } finally {
     checking.value = false
+  }
+}
+
+/** 材料图片走「新增临时素材」换 media_id，成功后回填到触发上传的那个字段 */
+function materialUpload(target: 'idCard' | 'license' | number): UploadRequestHandler {
+  return async (options) => {
+    uploading.value = true
+    try {
+      const mediaId = await uploadNicknameMaterial(props.appid, options.file as File)
+      if (typeof target === 'number') {
+        nicknameForm.otherStuff[target] = mediaId
+      } else {
+        nicknameForm[target] = mediaId
+      }
+      ElMessage.success('已上传，media_id 已填入（微信侧 3 天后失效）')
+    } catch (error) {
+      ElMessage.error(describeError(error))
+      throw error
+    } finally {
+      uploading.value = false
+    }
   }
 }
 
@@ -148,11 +163,15 @@ async function submitNickname(): Promise<void> {
   if (!valid) return
   submitting.value = true
   try {
-    await updateNickname(props.appid, {
+    const result = await updateNickname(props.appid, {
       nickname: nicknameForm.nickname.trim(),
-      credentials: credentialsPayload.value
+      idCard: nicknameForm.idCard.trim(),
+      license: nicknameForm.license.trim(),
+      namingOtherStuff: nicknameForm.otherStuff.map((item) => item.trim()).filter(Boolean)
     })
-    ElMessage.success('小程序名称已提交修改')
+    ElMessage.success(
+      result.auditId ? `已提交微信审核，审核单号 ${result.auditId}` : '名称已直接生效，无需审核'
+    )
     nicknameDialog.value = false
     await load()
   } catch (error) {
@@ -179,8 +198,16 @@ async function submitSignature(): Promise<void> {
   }
 }
 
+/** 微信对头像图片的限制：2M 以内，PNG/JPG/GIF/BMP */
+const AVATAR_MAX_BYTES = 2 * 1024 * 1024
+
 const avatarUpload: UploadRequestHandler = async (options) => {
   const file = options.file as File
+  if (file.size > AVATAR_MAX_BYTES) {
+    ElMessage.warning(`头像图片不能超过 2M，当前 ${Math.round(file.size / 1024)}K，请先压缩成正方形图片`)
+    return
+  }
+  uploading.value = true
   try {
     await updateAvatar(props.appid, file)
     ElMessage.success('头像已更新，微信侧生效可能有延迟')
@@ -188,6 +215,8 @@ const avatarUpload: UploadRequestHandler = async (options) => {
   } catch (error) {
     ElMessage.error(describeError(error))
     throw error
+  } finally {
+    uploading.value = false
   }
 }
 
@@ -223,12 +252,12 @@ defineExpose({ reload: load })
           <el-upload
             :show-file-list="false"
             :http-request="avatarUpload"
-            accept="image/png,image/jpeg"
-            :disabled="submitting"
+            accept="image/png,image/jpeg,image/gif,image/bmp"
+            :disabled="uploading"
           >
-            <el-button size="small" :icon="Upload">更换头像</el-button>
+            <el-button size="small" :loading="uploading" :icon="Upload">更换头像</el-button>
           </el-upload>
-          <p class="muted basic-info__avatar-tip">multipart 字段名 file，支持 jpg/png</p>
+          <p class="muted basic-info__avatar-tip">支持 PNG/JPG/GIF/BMP，不超过 2M，实际头像为正方形</p>
         </div>
 
         <div class="basic-info__summary">
@@ -288,9 +317,18 @@ defineExpose({ reload: load })
           <span>修改说明</span>
         </h3>
         <ul class="basic-info__tips">
-          <li>名称修改受微信侧次数限制，需上传名称占位/资质材料 media_id（多个用逗号分隔）。</li>
+          <li>
+            名称是否要提交资质材料，取决于「占用检查」有没有命中关键词：未命中直接改名即可，命中则需上传
+            身份证（个人主体）或营业执照/组织机构代码证（组织主体），材料 media_id 由界面上的「上传图片」换取，
+            在微信侧只保存 3 天。
+          </li>
+          <li>改名接口属于权限集 id 30，未授权时微信回 48001，需要管理员重新扫码授权并勾上它。</li>
+          <li>改名额度每个自然年 2 次（1 月 1 日与微信认证审核通过后重置），用尽后只能靠发起微信认证改名。</li>
           <li>简介每月可修改次数有限，提交后以微信侧审核结果为准。</li>
-          <li>头像为 multipart 上传，字段名 <span class="mono">file</span>，后端会先转成 mediaid 再提交。</li>
+          <li>
+            头像分两步：先把图片传成「新增临时素材」换 <span class="mono">media_id</span>，再带裁剪框提交；
+            别的途径拿到的素材 id 微信不认（40007）。图片 2M 以内，一年可申请修改 5 次。
+          </li>
         </ul>
       </div>
     </template>
@@ -308,25 +346,94 @@ defineExpose({ reload: load })
         <el-form-item label="新名称" prop="nickname">
           <el-input v-model="nicknameForm.nickname" placeholder="例如：某某市家具行业协会" maxlength="30" show-word-limit />
         </el-form-item>
-        <el-form-item label="名称类型">
-          <el-select v-model="nicknameForm.nameType" placeholder="按微信侧要求选择（可不填）" clearable>
-            <el-option v-for="item in nameTypeOptions" :key="item.value" :value="item.value" :label="item.label" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="资质材料 ID">
-          <el-input v-model="nicknameForm.credentialText" placeholder="media_id，多个用逗号分隔" />
-        </el-form-item>
-        <el-form-item label="企业名称">
-          <el-input v-model="nicknameForm.enterpriseName" placeholder="选填" />
-        </el-form-item>
-        <el-form-item label="组织机构代码">
-          <el-input v-model="nicknameForm.orgName" placeholder="选填" />
-        </el-form-item>
         <el-form-item label="占用检查">
           <el-button :loading="checking" :icon="CircleCheck" @click="onCheckNickname">检查名称是否可用</el-button>
         </el-form-item>
+        <el-form-item v-if="checkResult || checkError" label=" ">
+          <el-alert
+            v-if="checkResult"
+            :type="checkTone"
+            show-icon
+            :closable="false"
+            :title="checkSummary"
+            :description="checkResult.wording || ''"
+            class="basic-info__check"
+          />
+          <el-alert
+            v-else
+            type="error"
+            show-icon
+            :closable="false"
+            :title="`名称检测失败：${checkError}`"
+            class="basic-info__check"
+          />
+        </el-form-item>
+        <el-form-item label="身份证照片">
+          <div class="basic-info__material">
+            <el-input
+              v-model="nicknameForm.idCard"
+              placeholder="media_id，个人主体改名必填"
+              clearable
+              class="mono"
+            />
+            <el-upload
+              :show-file-list="false"
+              :http-request="materialUpload('idCard')"
+              accept="image/png,image/jpeg,image/gif"
+              :disabled="uploading"
+            >
+              <el-button :loading="uploading" :icon="Upload">上传图片</el-button>
+            </el-upload>
+          </div>
+        </el-form-item>
+        <el-form-item label="营业执照">
+          <div class="basic-info__material">
+            <el-input
+              v-model="nicknameForm.license"
+              placeholder="media_id，组织主体（协会/商会/企业）必填"
+              clearable
+              class="mono"
+            />
+            <el-upload
+              :show-file-list="false"
+              :http-request="materialUpload('license')"
+              accept="image/png,image/jpeg,image/gif"
+              :disabled="uploading"
+            >
+              <el-button :loading="uploading" :icon="Upload">上传图片</el-button>
+            </el-upload>
+          </div>
+          <p class="muted basic-info__tip">组织机构代码证同样填在这里，按微信要求二选一上传。</p>
+        </el-form-item>
+        <el-form-item
+          v-for="(_, index) in nicknameForm.otherStuff"
+          :key="index"
+          :label="`其他材料 ${index + 1}`"
+        >
+          <div class="basic-info__material">
+            <el-input
+              v-model="nicknameForm.otherStuff[index]"
+              placeholder="商标注册证、社会团体登记证书等 media_id"
+              clearable
+              class="mono"
+            />
+            <el-upload
+              :show-file-list="false"
+              :http-request="materialUpload(index)"
+              accept="image/png,image/jpeg,image/gif"
+              :disabled="uploading"
+            >
+              <el-button :loading="uploading" :icon="Upload">上传</el-button>
+            </el-upload>
+            <el-button text :icon="Delete" @click="nicknameForm.otherStuff.splice(index, 1)">删除</el-button>
+          </div>
+        </el-form-item>
+        <el-form-item v-if="nicknameForm.otherStuff.length < OTHER_STUFF_MAX" label=" ">
+          <el-button text type="primary" :icon="Plus" @click="nicknameForm.otherStuff.push('')">
+            添加其他证明材料
+          </el-button>
+        </el-form-item>
       </el-form>
-      <p v-if="checkResult" class="muted basic-info__check mono">{{ checkResult }}</p>
     </FormDialog>
 
     <FormDialog
@@ -443,8 +550,24 @@ defineExpose({ reload: load })
 }
 
 .basic-info__check {
-  margin: 0 0 4px;
+  width: 100%;
+}
+
+.basic-info__material {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.basic-info__material .el-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.basic-info__tip {
+  margin: 4px 0 0;
   font-size: 12px;
-  word-break: break-all;
+  line-height: 1.6;
 }
 </style>
