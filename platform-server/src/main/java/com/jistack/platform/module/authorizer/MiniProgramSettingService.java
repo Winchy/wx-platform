@@ -6,6 +6,7 @@ import com.jistack.platform.wechat.service.AuthorizerWriter;
 import com.jistack.platform.wechat.service.WechatCaller;
 import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
@@ -19,6 +20,7 @@ import java.util.Map;
  * 小程序运营配置：基本信息（名称/简介/头像）、服务器域名与业务域名、类目、体验成员。
  * 这些接口都通过 authorizer_access_token 代小程序操作。
  */
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class MiniProgramSettingService {
@@ -100,10 +102,16 @@ public class MiniProgramSettingService {
      */
     public Map<String, Object> qrcodeImage(String appid) {
         String url = resolveQrcodeUrl(appid);
-        byte[] image = caller.api().getBinaryAbsolute(url);
+        byte[] image;
+        try {
+            image = caller.api().getBinaryAbsolute(url);
+        } catch (RuntimeException first) {
+            url = refreshedLink(appid, url, first);
+            image = caller.api().getBinaryAbsolute(url);
+        }
         String format = imageFormat(image);
         if (format == null) {
-            throw new BizException("取回的内容不是图片（PNG/JPG/GIF/BMP），微信这次没有给出小程序码");
+            throw new BizException("取回的内容不是图片（PNG/JPG/GIF/BMP），微信这次没有给出小程序码：" + nonImageHint(image));
         }
         String contentType = "image/" + ("jpg".equals(format) ? "jpeg" : format);
         Map<String, Object> result = new LinkedHashMap<>();
@@ -127,6 +135,27 @@ public class MiniProgramSettingService {
             throw new BizException("微信未返回该小程序的小程序码链接，请先在授权列表「刷新资料」后重试");
         }
         return url;
+    }
+
+    /**
+     * 落库的 qrcode_url 里带的是微信一次性签发的 ticket，过期后 showqrcode 直接回 404 且不带错误码，
+     * 界面上就只剩「取图失败」。这里自动重新拉一次授权资料换新链接，而不是让用户先去点「刷新资料」。
+     *
+     * @return 刷新后的链接；链接没变化说明重试也没有意义，直接抛出首次失败
+     */
+    private String refreshedLink(String appid, String staleUrl, RuntimeException first) {
+        String freshUrl;
+        try {
+            freshUrl = authorizerWriter.refreshInfo(appid).getQrcodeUrl();
+        } catch (RuntimeException refreshError) {
+            refreshError.addSuppressed(first);
+            throw refreshError;
+        }
+        if (!StringUtils.hasText(freshUrl) || freshUrl.equals(staleUrl)) {
+            throw first;
+        }
+        log.warn("小程序码取图失败，已刷新授权资料后用新链接重试 appid={}：{}", appid, first.getMessage());
+        return freshUrl;
     }
 
     /** 新版 getaccountbasicinfo 已不返回小程序码链接，只有 api_get_authorizer_info 的 authorizer_info.qrcode_url 有。 */
@@ -266,6 +295,9 @@ public class MiniProgramSettingService {
 
     /** 微信按文件内容判断素材类型，不看本地文件名：这里用文件头识别，认不出就拒掉（WebP/HEIC/非图片）。 */
     private static String imageFormat(byte[] image) {
+        if (image == null) {
+            return null;
+        }
         if (image.length > 4 && (image[0] & 0xFF) == 0x89 && image[1] == 'P' && image[2] == 'N' && image[3] == 'G') {
             return "png";
         }
@@ -279,6 +311,22 @@ public class MiniProgramSettingService {
             return "bmp";
         }
         return null;
+    }
+
+    /**
+     * 取回的不是图片时，光说「不是图片」查不动：HTML 说明被重定向到登录/错误页，
+     * JSON 说明微信直接回了错误，空内容多半是出口被掐断。
+     */
+    private static String nonImageHint(byte[] image) {
+        if (image == null || image.length == 0) {
+            return "微信返回了空内容";
+        }
+        String head = new String(image, 0, Math.min(image.length, 160), java.nio.charset.StandardCharsets.UTF_8)
+                .replaceAll("[\\p{Cntrl}]", " ")
+                .trim();
+        String kind = head.startsWith("<") ? "HTML 页面（可能被重定向到登录或错误页）"
+                : head.startsWith("{") || head.startsWith("[") ? "JSON" : "未知内容";
+        return kind + "，共 " + image.length + " 字节，开头「" + head + "」";
     }
 
     /** multipart 的文件名会当作素材类型发给微信，后缀与真实格式不符（或没有后缀）时按真实格式改名。 */

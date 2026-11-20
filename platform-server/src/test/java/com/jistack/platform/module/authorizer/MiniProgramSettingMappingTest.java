@@ -13,7 +13,9 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 
 import java.util.List;
 import java.util.Map;
@@ -45,7 +47,12 @@ class MiniProgramSettingMappingTest {
     void setUp() throws Exception {
         server = new MockWebServer();
         server.start();
-        WechatApiClient api = new WechatApiClient(server.url("/").toString(), new RestTemplate(), json);
+        // 与生产 WechatClientFactory 同型的工厂 + 短读超时：裸 new RestTemplate() 没有超时，
+        // 桩不回响应时用例只会永久阻塞（jstack 里卡在复用连接的 getResponseCode）。
+        SimpleClientHttpRequestFactory http = new SimpleClientHttpRequestFactory();
+        http.setConnectTimeout(2000);
+        http.setReadTimeout(3000);
+        WechatApiClient api = new WechatApiClient(server.url("/").toString(), new RestTemplate(http), json);
 
         WechatCaller caller = mock(WechatCaller.class);
         when(caller.authorizer(anyString(), anyString(), any())).thenAnswer(invocation -> {
@@ -56,6 +63,8 @@ class MiniProgramSettingMappingTest {
         when(caller.api()).thenReturn(api);
         writer = mock(AuthorizerWriter.class);
         when(writer.require(anyString())).thenReturn(new Authorizer());
+        // 取图失败会先「刷新资料」再重试一次；默认换不出新链接，让首因原样抛出
+        when(writer.refreshInfo(anyString())).thenReturn(new Authorizer());
         service = new MiniProgramSettingService(caller, writer);
     }
 
@@ -72,6 +81,13 @@ class MiniProgramSettingMappingTest {
 
     private RecordedRequest take() throws Exception {
         return server.takeRequest();
+    }
+
+    /** 无参的 takeRequest() 等不到请求会一直阻塞，整轮测试跟着挂死；这里超时即失败。 */
+    private RecordedRequest takeRequest() throws Exception {
+        RecordedRequest request = server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS);
+        assertThat(request).as("桩在 5 秒内没等到请求").isNotNull();
+        return request;
     }
 
     private JsonNode requestBody() throws Exception {
@@ -674,6 +690,86 @@ class MiniProgramSettingMappingTest {
 
         assertThatThrownBy(() -> service.qrcodeImage(APPID))
                 .isInstanceOf(BizException.class)
-                .hasMessageContaining("不是图片");
+                .hasMessageContaining("不是图片")
+                .hasMessageContaining("HTML 页面");
+    }
+
+    @Test
+    @DisplayName("小程序码：微信回空体时说清是空内容，不是「未知格式」")
+    void qrcodeRejectsEmptyBody() {
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=X");
+        imageResponse(new byte[0], "image/jpeg");
+
+        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("空内容");
+    }
+
+    @Test
+    @DisplayName("小程序码：连接中途断开要原样抛 ResourceAccessException，好让界面看到出口网络原因")
+    void qrcodeConnectionBreakStaysReadable() {
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=X");
+        server.enqueue(new MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_START));
+
+        // 包成 IllegalStateException 只会显示「服务器内部错误: null」；透传才有 502 的「出口网络不通」
+        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+                .isInstanceOf(ResourceAccessException.class);
+    }
+
+    @Test
+    @DisplayName("小程序码：ticket 过期（404 空体）时自动刷新资料换新链接重试")
+    void qrcodeRetriesWithFreshLink() throws Exception {
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=EXPIRED");
+        Authorizer fresh = new Authorizer();
+        fresh.setQrcodeUrl(server.url("/cgi-bin/showqrcode?ticket=FRESH").toString());
+        when(writer.refreshInfo(anyString())).thenReturn(fresh);
+        // 按路径分派而不是顺序 enqueue：JDK 的连接池按 host:port 复用，桩端口又每例重分配，
+        // 顺序队列会被多消耗一次，第二次请求就永远等不到响应。
+        server.setDispatcher(new okhttp3.mockwebserver.Dispatcher() {
+            @Override
+            public MockResponse dispatch(RecordedRequest request) {
+                if (request.getPath() != null && request.getPath().contains("ticket=FRESH")) {
+                    return new MockResponse().addHeader("Content-Type", "image/png")
+                            .setBody(new okio.Buffer().write(pngBytes()));
+                }
+                return new MockResponse().setResponseCode(404).setHeader("Connection", "close");
+            }
+        });
+
+        Map<String, Object> result = service.qrcodeImage(APPID);
+
+        assertThat(takeRequest().getPath()).isEqualTo("/cgi-bin/showqrcode?ticket=EXPIRED");
+        assertThat(takeRequest().getPath()).isEqualTo("/cgi-bin/showqrcode?ticket=FRESH");
+        // 界面「复制图片链接」拿到的必须是实际取到图的那条，否则复制出去的还是过期 ticket
+        assertThat(result.get("url")).asString().endsWith("ticket=FRESH");
+        assertThat(result.get("dataUrl")).asString().startsWith("data:image/png;base64,");
+    }
+
+    @Test
+    @DisplayName("小程序码：刷新后链接没变就抛首因，不再发第二次取图请求")
+    void qrcodeKeepsFirstErrorWhenLinkUnchanged() throws Exception {
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=EXPIRED");
+        // 错误状态一律关连接：JDK 连接池按 host:port 复用，桩每例换端口却可能拿到同一个号
+        server.enqueue(new MockResponse().setResponseCode(404).setHeader("Connection", "close"));
+
+        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("404");
+        assertThat(server.getRequestCount()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("小程序码：微信回 4xx 时带上状态码与错误体，不留「[no body]」")
+    void qrcodeReportsHttpErrorBody() {
+        withQrcodeLink("/cgi-bin/showqrcode?ticket=X");
+        server.enqueue(new MockResponse().setResponseCode(403)
+                .setHeader("Connection", "close")
+                .addHeader("Content-Type", "text/html")
+                .setBody("<html>access denied</html>"));
+
+        assertThatThrownBy(() -> service.qrcodeImage(APPID))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("403")
+                .hasMessageContaining("access denied");
     }
 }

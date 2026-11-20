@@ -10,6 +10,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.client.HttpStatusCodeException;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
@@ -246,9 +247,26 @@ public class WechatApiClient {
             return body;
         } catch (WechatApiException ex) {
             throw ex;
+        } catch (ResourceAccessException ex) {
+            // 同 exchange()：连接中断要原样透传，包成 IllegalStateException 界面只剩「服务器内部错误」
+            log.error("微信二进制接口连接中断 {}: {}", path, ex.getMessage());
+            throw ex;
+        } catch (HttpStatusCodeException ex) {
+            // 默认错误处理器不读错误体，界面只剩「403 Forbidden: [no body]」，看不出微信拒绝的理由
+            throw new BizException(502, "微信图片接口 " + path + " 返回 " + ex.getStatusCode().value()
+                    + "：" + briefText(ex.getResponseBodyAsString()), ex);
         } catch (Exception ex) {
             throw new IllegalStateException("微信二进制接口调用失败 " + path + ": " + ex.getMessage(), ex);
         }
+    }
+
+    /** 微信的错误体可能是一整页 HTML，截断并去掉控制字符后才能进界面和日志。 */
+    private static String briefText(String body) {
+        if (body == null || body.isBlank()) {
+            return "响应体为空";
+        }
+        String cleaned = body.replaceAll("[\\p{Cntrl}]", " ").trim();
+        return cleaned.length() <= 160 ? cleaned : cleaned.substring(0, 160) + "…";
     }
 
     private HttpEntity<String> jsonEntity(Object body) {

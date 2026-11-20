@@ -29,14 +29,32 @@ public class WechatCallbackController {
     private final WeChatCallbackService callbackService;
     private final AuthorizationService authorizationService;
 
+    /**
+     * 容器健康检查用。以前 HEALTHCHECK 直接打 /wx/callback，每 30 秒就在业务日志里
+     * 留下一条与微信无关的探测请求；这个端点只证明服务和映射活着。
+     */
+    @GetMapping(value = "/health", produces = MediaType.TEXT_PLAIN_VALUE)
+    public String health() {
+        return "ok";
+    }
+
     /** 开放平台后台填「消息与事件接收 URL」时先做 GET 校验。 */
     @GetMapping(value = {"/callback", "/callback/{appid}"}, produces = MediaType.TEXT_PLAIN_VALUE)
     public String verify(@RequestParam(name = "signature", required = false) String signature,
-                         @RequestParam("timestamp") String timestamp,
-                         @RequestParam("nonce") String nonce,
+                         @RequestParam(name = "msg_signature", required = false) String msgSignature,
+                         @RequestParam(name = "timestamp", required = false) String timestamp,
+                         @RequestParam(name = "nonce", required = false) String nonce,
                          @RequestParam(name = "echostr", required = false) String echoStr) {
+        if (timestamp == null || nonce == null) {
+            // 微信真正的校验一定带这三个参数；不带参数的 GET 是浏览器直开或监控探测，
+            // 用必填 @RequestParam 会变成 500 + 整段栈，把同期要查的错误淹掉。
+            log.warn("回调 URL 校验缺少 timestamp/nonce，多半是浏览器或监控直接访问了回调地址");
+            return "verify failed: missing timestamp/nonce";
+        }
+        // 普通模式把签名放在 signature，安全模式放在 msg_signature（与 POST 推送同名），只认一个会恒校验失败
+        String provided = signature != null ? signature : msgSignature;
         try {
-            return callbackService.verifyUrl(signature, timestamp, nonce, echoStr);
+            return callbackService.verifyUrl(provided, timestamp, nonce, echoStr);
         } catch (Exception ex) {
             log.error("回调 URL 校验失败: {}", ex.toString());
             return "verify failed: " + ex.getMessage();
@@ -52,9 +70,15 @@ public class WechatCallbackController {
     @PostMapping(value = {"/callback", "/callback/{appid}"}, produces = MediaType.TEXT_PLAIN_VALUE)
     public String push(@RequestParam(name = "msg_signature", required = false) String msgSignature,
                        @RequestParam(name = "signature", required = false) String signature,
-                       @RequestParam("timestamp") String timestamp,
-                       @RequestParam("nonce") String nonce,
+                       @RequestParam(name = "timestamp", required = false) String timestamp,
+                       @RequestParam(name = "nonce", required = false) String nonce,
                        @RequestBody(required = false) String body) {
+        if (timestamp == null || nonce == null) {
+            // 微信的推送必带 msg_signature/timestamp/nonce，缺参数的 POST 来自扫描或误配置，
+            // 再往下走会在签名拼接里 NPE 变成 500。
+            log.warn("回调推送缺少 timestamp/nonce，已忽略（非微信真实推送）");
+            return "verify failed: missing timestamp/nonce";
+        }
         return callbackService.handlePush(msgSignature != null ? msgSignature : signature, timestamp, nonce, body);
     }
 

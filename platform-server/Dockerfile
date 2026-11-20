@@ -20,8 +20,9 @@ RUN apt-get update \
 COPY --from=build /src/target/platform-server-*.jar app.jar
 EXPOSE 8080
 
-# /wx/callback 缺 timestamp/nonce 会返回 500，但只要有 HTTP 响应就说明服务和映射都活着
+# 用专门的 /wx/health 探针：打 /wx/callback 会因为缺 timestamp/nonce 每 30 秒往业务日志里
+# 塞一条无关请求，真正要查的错误反而被淹掉。-f 让非 2xx 也能判失败。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=5 \
-    CMD curl -s -o /dev/null http://127.0.0.1:8080/wx/callback || exit 1
+    CMD curl -fsS -o /dev/null http://127.0.0.1:8080/wx/health || exit 1
 
 ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]

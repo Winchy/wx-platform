@@ -40,9 +40,9 @@ npm run build                    # vue-tsc --noEmit + vite build，产物 dist/
 cd platform-server && mvn -B test
 ```
 
-- 178 个用例不需要任何中间件：安全模式加解密闭环、MockWebServer 锁定的微信接口契约（路径/字段名/请求体/分帧方式）、
-  发布链路状态机（commit→提审→审核→发布/灰度/回退）、令牌链刷新与轮换回写、回调分发、微信接口域名的优先级、
-  Web 层参数绑定与错误码映射。
+- 185 个用例不需要任何中间件：安全模式加解密闭环、MockWebServer 锁定的微信接口契约（路径/字段名/请求体/分帧方式）、
+  发布链路状态机（commit→提审→审核→发布/灰度/回退）、令牌链刷新与轮换回写、回调分发（含不带参数探测）、
+  图片直链抓取失败分型、微信接口域名的优先级、Web 层参数绑定与错误码映射。
 - 17 个 `PlatformEndToEndTest` 只在 3306 与 6379 都能连上时才执行（`@EnabledIf("infrastructureReady")`）。
   它们用随机库名 `wxplat_e2e_*` + Redis db9，跑完 drop，不污染开发数据；微信侧由 MockWebServer 桩出来，
   不需要真实凭据、也不需要公网域名。没起容器时这些用例显示 skipped，不是失败。
@@ -218,11 +218,21 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
   界面显示 `dataUrl`，「复制图片链接」仍给微信原始直链（贴到地址栏能直接打开）。
   落库的链接属于数据而非可信输入，抓取前校验主机（只放行 `*.weixin.qq.com`，或与 `api_base` 同主机同协议——后者供测试桩与私有部署），
   取回的内容再按文件头确认是图片，避免把错误页当二维码显示。
+- `showqrcode` 的 `ticket` 是微信一次性签发的，**过期后直接回 HTTP 404 且响应体为空、不带 errcode**（本机对真实
+  `mp.weixin.qq.com` 域名实测过这个形状）。落库链接里的 ticket 多半随时间失效，所以取图失败会自动调一次
+  `api_get_authorizer_info` 换新链接重试，响应里的 `url` 是实际取到图的那条（否则「复制图片链接」复制出去仍是过期 ticket）；
+  新链接与旧链接相同则不重试，直接把首因抛出。抓取失败分四类可见：非微信主机→抓取前就拒；连接中断→502 并提示出口网络；
+  微信回 4xx→带上状态码与错误体片段；回 200 但不是图片→说明回来的是 HTML/JSON/空体。
+- 「消息与事件接收 URL」被**不带参数**访问时必须回一行纯文本，不能抛 `MissingServletRequestParameterException`：
+  必填 `@RequestParam` 会让每次探测产生一整段 ERROR 栈（容器健康检查原先正是打这个地址，每 30 秒刷一条，把同期真正要查的错误淹掉）。
+  健康检查改打独立的 `GET /wx/health`；缺参/无映射各有一行日志的处理器；`BizException` 现在也记一行 WARN（以前界面显示中文原因、日志完全空白）。
+- GET URL 校验的签名参数名随加解密方式不同：普通模式放 `signature`，安全模式放 `msg_signature`（与 POST 推送同名）。
+  只读其中一个，另一种模式下签名恒校验失败、开放平台后台就保存不了回调地址，所以两个都取。
 
 ## 6. 测试
 
 ```bash
-mvn -B test          # 195 个用例：178 个无需中间件 + 17 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
+mvn -B test          # 202 个用例：185 个无需中间件 + 17 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
 ```
 
 | 测试类 | 锁住的东西 |
@@ -235,7 +245,7 @@ mvn -B test          # 195 个用例：178 个无需中间件 + 17 个连本机 
 | `AuthorizerTokenRotationTest` | 令牌链：refresh_token 轮换必须回写、失效只重试一次、61023 判定授权失效 |
 | `ReleaseWorkflowTest` | 发布链路状态机：ext_json 组装、auditid 落库、AUDIT_PASS/GRAY/REVERTED 流转 |
 | `ReleaseIcpStatusTest` | 备案 1024~1031 前置条件按位解码（基本信息/类目/认证），缺项一次性列全 |
-| `MiniProgramSettingMappingTest` | 微信下划线字段 ↔ 界面驼峰字段（域名六类、invalid/noIcp、certicates 拼写）；multipart 出站带 Content-Length 而非 chunked；普通方式注册时改名本地拦下；小程序码代取（落库链接优先、非微信主机零请求直接拒、回传 data URL、非图片点名） |
+| `MiniProgramSettingMappingTest` | 微信下划线字段 ↔ 界面驼峰字段（域名六类、invalid/noIcp、certicates 拼写）；multipart 出站带 Content-Length 而非 chunked；普通方式注册时改名本地拦下；小程序码代取（落库链接优先、非微信主机零请求直接拒、回传 data URL、非图片/空体/4xx/连接中断四类失败各有可读原因、ticket 过期自动刷新资料换新链接重试） |
 | `MiniProgramPrivacySettingTest` | 隐私保护指引请求体（privacy_ver / setting_list / owner_setting） |
 | `PlatformDomainServiceTest` | 第三方平台域名白名单：`;` 拼接的裸主机名、两类接口字段名不同（`wxa_server_domain`/`wxa_jump_h5_domain`）、写后必须再 `get`、端口与空清单本地拦住 |
 | `PlatformConfigSerializationTest` | 密钥不进 toString/日志/响应，PUT 的明文密钥能正常绑定 |
@@ -454,6 +464,24 @@ E2E 的 `MockWeChatServer` 把该响应自造成为 `{grayinfo:{...}}`、并把 
 桩只能证明本站这条链路（路由 → 服务 → 抓取 → data URL → 界面），
 「服务端不带 Referer 时微信确实回原图」仍要等真实凭据与线上域名才能确认。
 
+线上反馈「页面显示小程序码取图失败」时贴来的日志却是 `Required request parameter 'timestamp' ... not present`——
+这条**不是**取图失败：`Dockerfile` 的 `HEALTHCHECK` 每 30 秒 `curl /wx/callback` 不带任何 query，
+而 `verify` 把 `timestamp/nonce` 声明成必填 `@RequestParam`，于是每 30 秒刷一整段 `未处理异常` 栈，
+真正要查的那条错误反而淹在里面。更糟的是取图失败走 `BizException`，而 `GlobalExceptionHandler.handleBiz` 一行日志都不写，
+前端取图又是 `SILENT`（不弹 toast），所以那次失败在日志里完全隐形。
+本轮补了 7 例（后端 202 例全绿，原 195 + 7）：`PlatformWebContractTest` 锁住不带参数的 GET/POST 回一行纯文本且绝不进加解密、
+`/wx/health` 探针可用、GET 校验只带 `msg_signature` 时也要认；`MiniProgramSettingMappingTest` 锁住非图片说清回来的是 HTML、
+空体说清是空内容、4xx 带状态码与错误体、连接中断原样抛 `ResourceAccessException`（否则界面只剩「服务器内部错误: null」）、
+以及 ticket 过期先刷新授权资料换新链接重试一次（新链接与旧链接相同则不重试，`getRequestCount()` 为 1 守住这点，
+且重试成功后响应的 `url` 必须换成新链接，否则「复制图片链接」复制出去的还是过期 ticket）。
+`showqrcode` 对过期 ticket 回 **HTTP 404 + 空响应体、不带 errcode** 这个形状，是本机直接 `curl` 真实
+`mp.weixin.qq.com` 域名拿到的（无效 ticket 一律 404 空体），不是猜的。
+桩侧两个新坑：测试用的 `RestTemplate` 必须像生产 `WechatClientFactory` 一样设读超时，否则连接池踩到服务端已关的连接时
+用例会永久阻塞（`jstack` 卡在 `HttpURLConnection.getResponseCode`，实测冻住整轮近 6 分钟），
+且错误状态响应要带 `Connection: close`；多请求用例别依赖顺序 `enqueue`，改按路径分派的 `Dispatcher`。
+取图的真因仍要部署后看那一行新日志确认（`docker compose logs api | grep -E "业务异常|微信图片接口"`），
+头号候选是过期 ticket——现在有自动刷新重试，界面若仍失败会直接写明是 404、连接不通还是内容不是图片。
+
 仍只能等真实凭据与备案域名才能验证：真实 `component_appid`/`component_secret` 换取 token、出口 IP 白名单（缺失报 `40164`）、
 公网 https 备案域名的微信侧校验、已备案小程序才允许发布、宿主机 nginx 的证书链与 `/wx/` 透传（compose 已不含 caddy）。
 第三方平台的加急额度余量也没有可查接口，用超了只能等微信返回错误码。
@@ -463,6 +491,9 @@ E2E 的 `MockWeChatServer` 把该响应自造成为 `{grayinfo:{...}}`、并把 
 本地已经用桩与 `MockWeChatServer` 覆盖了下面每一步的**代码分支**，缺的只是真实微信侧的答复。拿到凭据与备案域名后照顺序跑，
 任一步不过就别往下走——后面全部依赖前一步的令牌与授权状态。
 
+0. **部署自检**：`curl https://<域名>/wx/health` 回 `ok` —— 同时证明 api 镜像是重新构建的、宿主机 nginx 的 `/wx/` 透传正常；
+   `docker compose logs api` 里不该再有每 30 秒一条的 `timestamp` 缺参异常，业务失败现在都是一行 `业务异常 ... message=...`。
+   若小程序码报「后端没有这个接口」，就是 `docker compose build api` 没跑或没生效。
 1. **凭据落库 + 票据**：按 `deploy/docker-compose.yml` 的 `environment` 列出哪些要填，在 `deploy/` 下本地新建 env 填真实
    `component_appid`/`component_secret`/消息加解密密钥与 `aes_key`（仓库里不放 env 文件，也不要把密钥抄进任何提交物），
    起整栈后看「平台配置」页 `secretSet/messageTokenSet/aesKeySet` 全为真、`ticketFresh` 为真。

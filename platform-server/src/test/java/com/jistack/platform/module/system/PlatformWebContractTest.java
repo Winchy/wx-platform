@@ -32,6 +32,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -114,6 +115,41 @@ class PlatformWebContractTest {
                         .param("nonce", "n").param("echostr", "e"))
                 .andExpect(status().isOk())
                 .andExpect(content().string("ECHO_1"));
+    }
+
+    @Test
+    @DisplayName("URL 校验的签名放在 msg_signature 时也要认（安全模式）")
+    void callbackVerifyAcceptsMsgSignature() throws Exception {
+        // 只读 signature 时安全模式的校验永远拿到 null，后台「消息与事件接收 URL」保存不了
+        when(callbackService.verifyUrl(any(), any(), any(), any())).thenReturn("ECHO_2");
+
+        mvc.perform(get("/wx/callback/wx9a1b2c3d4e5f6071")
+                        .param("msg_signature", "SEC_SIG").param("timestamp", "1763000000")
+                        .param("nonce", "n").param("echostr", "ENC"))
+                .andExpect(status().isOk())
+                .andExpect(content().string("ECHO_2"));
+
+        verify(callbackService).verifyUrl("SEC_SIG", "1763000000", "n", "ENC");
+    }
+
+    @Test
+    @DisplayName("不带参数探测回调地址不再抛 500：容器健康检查改打 /wx/health")
+    void callbackProbeWithoutParams() throws Exception {
+        // 之前 timestamp/nonce 是必填 @RequestParam，浏览器直开回调地址或 HEALTHCHECK 探测
+        // 每 30 秒就在日志里留一整段栈，把真正要查的错误淹掉。
+        mvc.perform(get("/wx/callback"))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("missing timestamp/nonce")));
+        verify(callbackService, never()).verifyUrl(any(), any(), any(), any());
+
+        mvc.perform(post("/wx/callback").contentType(MediaType.TEXT_PLAIN).content("<xml><Encrypt>x</Encrypt></xml>"))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("missing timestamp/nonce")));
+        verify(callbackService, never()).handlePush(any(), any(), any(), any());
+
+        mvc.perform(get("/wx/health"))
+                .andExpect(status().isOk())
+                .andExpect(content().string("ok"));
     }
 
     @Test
