@@ -18,6 +18,8 @@ public class SysUser {
     private String nickname;
     private String role;
     private Integer status;
+    /** 密码版本号：改密即 +1，令牌里带的版本与这里不一致就当未登录 */
+    private Integer pwdVer;
     private LocalDateTime lastLoginAt;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;

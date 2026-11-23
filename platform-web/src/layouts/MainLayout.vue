@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, ref, type Component } from 'vue'
+import { computed, reactive, ref, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import {
   ArrowDown,
   Bell,
@@ -17,10 +17,13 @@ import {
   Odometer,
   Promotion,
   Setting,
+  SwitchButton,
   Tools,
   User
 } from '@element-plus/icons-vue'
 
+import { changePassword } from '@/api/auth'
+import { FormDialog } from '@/components'
 import { useAuthStore } from '@/stores/auth'
 
 interface MenuEntry {
@@ -125,9 +128,72 @@ async function onLogout(): Promise<void> {
   void router.push({ name: 'login' })
 }
 
+const pwdVisible = ref(false)
+const pwdSubmitting = ref(false)
+const pwdFormRef = ref<FormInstance>()
+const pwdForm = reactive({ oldPassword: '', newPassword: '', confirmPassword: '' })
+
+const pwdRules: FormRules<typeof pwdForm> = {
+  oldPassword: [{ required: true, message: '请输入原密码', trigger: 'blur' }],
+  newPassword: [
+    { required: true, message: '请输入新密码', trigger: 'blur' },
+    { min: 8, max: 64, message: '新密码长度需为 8-64 位', trigger: 'blur' },
+    {
+      validator: (_rule, value, callback) => {
+        callback(value && value === pwdForm.oldPassword
+          ? new Error('新密码不能与原密码相同')
+          : undefined)
+      },
+      trigger: 'blur'
+    }
+  ],
+  confirmPassword: [
+    { required: true, message: '请再次输入新密码', trigger: 'blur' },
+    {
+      validator: (_rule, value, callback) => {
+        callback(value && value === pwdForm.newPassword ? undefined : new Error('两次输入的新密码不一致'))
+      },
+      trigger: 'blur'
+    }
+  ]
+}
+
+function openPasswordDialog(): void {
+  pwdForm.oldPassword = ''
+  pwdForm.newPassword = ''
+  pwdForm.confirmPassword = ''
+  pwdVisible.value = true
+}
+
+async function onSubmitPassword(): Promise<void> {
+  const form = pwdFormRef.value
+  if (form) {
+    try {
+      await form.validate()
+    } catch {
+      return
+    }
+  }
+  pwdSubmitting.value = true
+  try {
+    await changePassword({ oldPassword: pwdForm.oldPassword, newPassword: pwdForm.newPassword })
+    pwdVisible.value = false
+    // 改密把当前令牌一起作废了，只能本地清会话；再调 /logout 是用一枚已失效的令牌
+    auth.reset()
+    ElMessage.success('密码已修改，请用新密码重新登录')
+    void router.push({ name: 'login' })
+  } catch {
+    // 原密码不正确 / 长度不够 / 与原密码相同，都由请求层统一提示，这里不再重复弹一次
+  } finally {
+    pwdSubmitting.value = false
+  }
+}
+
 function onCommand(command: string): void {
   if (command === 'logout') {
     void onLogout()
+  } else if (command === 'password') {
+    openPasswordDialog()
   } else if (command === 'settings') {
     void router.push('/settings/platform')
   }
@@ -195,8 +261,9 @@ function onCommand(command: string): void {
             </span>
             <template #dropdown>
               <el-dropdown-menu>
-                <el-dropdown-item command="settings">平台配置</el-dropdown-item>
-                <el-dropdown-item divided command="logout">退出登录</el-dropdown-item>
+                <el-dropdown-item command="password" :icon="Lock">修改密码</el-dropdown-item>
+                <el-dropdown-item command="settings" :icon="Setting">平台配置</el-dropdown-item>
+                <el-dropdown-item divided command="logout" :icon="SwitchButton">退出登录</el-dropdown-item>
               </el-dropdown-menu>
             </template>
           </el-dropdown>
@@ -211,6 +278,53 @@ function onCommand(command: string): void {
         </router-view>
       </el-main>
     </el-container>
+
+    <FormDialog
+      v-model="pwdVisible"
+      title="修改密码"
+      width="440px"
+      confirm-text="保存新密码"
+      :loading="pwdSubmitting"
+      @confirm="onSubmitPassword"
+    >
+      <el-alert
+        class="layout__pwd-alert"
+        type="warning"
+        :closable="false"
+        show-icon
+        title="保存后当前登录立即失效，需要用新密码重新登录。"
+      />
+      <el-form ref="pwdFormRef" :model="pwdForm" :rules="pwdRules" label-width="92px" @submit.prevent>
+        <el-form-item label="原密码" prop="oldPassword">
+          <el-input
+            v-model="pwdForm.oldPassword"
+            type="password"
+            show-password
+            autocomplete="current-password"
+            placeholder="请输入当前密码"
+          />
+        </el-form-item>
+        <el-form-item label="新密码" prop="newPassword">
+          <el-input
+            v-model="pwdForm.newPassword"
+            type="password"
+            show-password
+            autocomplete="new-password"
+            placeholder="8-64 位，且不能与原密码相同"
+          />
+        </el-form-item>
+        <el-form-item label="确认新密码" prop="confirmPassword">
+          <el-input
+            v-model="pwdForm.confirmPassword"
+            type="password"
+            show-password
+            autocomplete="new-password"
+            placeholder="请再次输入新密码"
+            @keyup.enter="onSubmitPassword"
+          />
+        </el-form-item>
+      </el-form>
+    </FormDialog>
   </el-container>
 </template>
 
@@ -336,5 +450,9 @@ function onCommand(command: string): void {
   background: var(--app-bg);
   padding: 0;
   overflow: auto;
+}
+
+.layout__pwd-alert {
+  margin-bottom: 16px;
 }
 </style>

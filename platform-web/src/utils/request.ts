@@ -131,6 +131,15 @@ function buildBusinessError(body: ApiEnvelope<unknown>, httpStatus: number, sile
   })
 }
 
+/** 取包装里的 message：非 JSON 包装（网关错误页等）返回空串，交给调用方兜底 */
+function envelopeMessage(data: unknown): string {
+  if (data && typeof data === 'object' && !(data instanceof Blob) && !(data instanceof ArrayBuffer)) {
+    const message = (data as ApiEnvelope<unknown>).message
+    if (typeof message === 'string' && message.trim()) return message
+  }
+  return ''
+}
+
 function asWechatError(data: unknown): { errcode?: number; errmsg?: string; errcodeText: string } {
   if (data && typeof data === 'object') {
     const raw = data as Record<string, unknown>
@@ -149,7 +158,9 @@ function toApiError(error: AxiosError<ErrorPayload>): ApiError {
   let message = error.message || '网络异常'
 
   if (status === 401) {
-    message = '登录状态已失效，请重新登录'
+    // 后端在 401 里写清了原因（密码已修改 / 账号已禁用 / 登录已过期），
+    // 通用文案会把「改密后请用新密码登录」这类关键提示冲掉，所以只在没有原因时才兜底。
+    message = envelopeMessage(error.response?.data) || '登录状态已失效，请重新登录'
     clearToken()
     if (!error.config?.skipAuthRedirect && !window.location.pathname.startsWith('/login')) {
       const redirect = encodeURIComponent(window.location.pathname + window.location.search)

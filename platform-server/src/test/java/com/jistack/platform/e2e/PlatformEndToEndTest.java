@@ -234,6 +234,60 @@ class PlatformEndToEndTest {
                 .andExpect(jsonPath("$.code").value(0));
     }
 
+    @Test
+    @DisplayName("改密码：pwd_ver 当场作废旧令牌，新密码可登录，改回默认值不影响后续用例")
+    void changePasswordInvalidatesIssuedTokens() throws Exception {
+        String newPasswd = "E2eNewPass2026";
+        String issuedToken = token;
+
+        // 原密码不对：403，且不改任何东西（下一步用原密码照样能改）
+        mvc.perform(MockMvcRequestBuilders.put("/api/auth/password")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + issuedToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(
+                                Map.of("oldPassword", "not-the-password", "newPassword", newPasswd))))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value(403))
+                .andExpect(jsonPath("$.message").value("原密码不正确"));
+
+        // 强度不够：400，同样没改
+        mvc.perform(MockMvcRequestBuilders.put("/api/auth/password")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + issuedToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(
+                                Map.of("oldPassword", "admin123", "newPassword", "short"))))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message", Matchers.containsString("8-64")));
+
+        api(HttpMethod.PUT, "/api/auth/password", Map.of("oldPassword", "admin123", "newPassword", newPasswd));
+
+        // 改密请求自己带的那枚令牌也一起作废：拦截器按 pwd_ver 复核，等不到 TTL 到期
+        mvc.perform(MockMvcRequestBuilders.get("/api/auth/me")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + issuedToken))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.message", Matchers.containsString("密码已修改")));
+
+        // 旧密码登录不进去，新密码能
+        mvc.perform(MockMvcRequestBuilders.post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of("username", "admin", "password", "admin123"))))
+                .andExpect(status().isUnauthorized());
+        String renewed = json.readTree(execute(MockMvcRequestBuilders.post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of("username", "admin", "password", newPasswd)))))
+                .path("data").path("token").asText();
+        mvc.perform(MockMvcRequestBuilders.get("/api/auth/me")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + renewed))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.username").value("admin"));
+
+        // 改回默认密码，否则后面每个用例的 login() 都登不上
+        token = renewed;
+        api(HttpMethod.PUT, "/api/auth/password", Map.of("oldPassword", newPasswd, "newPassword", "admin123"));
+        login();
+        assertThat(api(HttpMethod.GET, "/api/auth/me", null).path("username").asText()).isEqualTo("admin");
+    }
+
     // ------------------------------------------------------------------ 回调
 
     @Test

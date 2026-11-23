@@ -24,7 +24,8 @@ cd platform-server && mvn -B spring-boot:run   # Flyway 自动建表，首次写
 # 打包：mvn -B package → target/platform-server-0.1.0-SNAPSHOT.jar
 ```
 
-默认账号 `admin / admin123`，登录后请立刻在系统内改密（`sys_user`，BCrypt 存储）。
+默认账号 `admin / admin123`，登录后请立刻改密：顶栏账号下拉 →「修改密码」（`sys_user.password_hash` 存 BCrypt，
+改完此前签发的所有登录令牌当场失效，需要用新密码重新登录）。
 
 ```bash
 cd platform-web && npm ci        # Node 需 ≥20，仓库带 .nvmrc=24：nvm use
@@ -40,10 +41,10 @@ npm run build                    # vue-tsc --noEmit + vite build，产物 dist/
 cd platform-server && mvn -B test
 ```
 
-- 185 个用例不需要任何中间件：安全模式加解密闭环、MockWebServer 锁定的微信接口契约（路径/字段名/请求体/分帧方式）、
-  发布链路状态机（commit→提审→审核→发布/灰度/回退）、令牌链刷新与轮换回写、回调分发（含不带参数探测）、
+- 204 个用例不需要任何中间件：安全模式加解密闭环、MockWebServer 锁定的微信接口契约（路径/字段名/请求体/分帧方式）、
+  发布链路状态机（commit→提审→审核→发布/灰度/回退）、令牌链刷新与轮换回写、改密与登录令牌的版本作废、回调分发（含不带参数探测）、
   图片直链抓取失败分型、微信接口域名的优先级、Web 层参数绑定与错误码映射。
-- 17 个 `PlatformEndToEndTest` 只在 3306 与 6379 都能连上时才执行（`@EnabledIf("infrastructureReady")`）。
+- 19 个 `PlatformEndToEndTest` 只在 3306 与 6379 都能连上时才执行（`@EnabledIf("infrastructureReady")`）。
   它们用随机库名 `wxplat_e2e_*` + Redis db9，跑完 drop，不污染开发数据；微信侧由 MockWebServer 桩出来，
   不需要真实凭据、也不需要公网域名。没起容器时这些用例显示 skipped，不是失败。
 
@@ -167,7 +168,7 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
 
 | 前缀 | 说明 |
 | --- | --- |
-| `/api/auth/*` | 登录、当前用户（`login` 免鉴权） |
+| `/api/auth/*` | 登录、当前用户、改密（`login` 免鉴权；`PUT /password` 成功即作废调用方自己那枚令牌） |
 | `/api/platform/*` | 平台凭据、健康检查、ticket 列表、重新开启推送、`domains/{kind}`（`server`/`jump`，第三方平台账号自身的域名白名单） |
 | `/api/authorizers/*` | 授权小程序列表/详情/刷新/同步/解除、授权会话 |
 | `/api/authorizers/{appid}/…` | `code` `experience-qrcode` `pages` `code-info` `audit*` `publish` `gray-release*` `revert*` `release/*` |
@@ -184,6 +185,15 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
 - `PLATFORM_MASTER_KEY` 变更后，库中已加密的 `component_secret` / `EncodingAESKey` / `authorizer_refresh_token` 无法解密，
   必须重新填写凭据并重新授权。
 - 未设置主密钥时 `SecretCipher` 使用临时密钥（启动日志会告警），重启即失效，仅供本地试跑。
+- 登录令牌同样是无状态签名串（`TokenService`，HMAC-SHA256，默认 12 小时），里面多带一个 `pv` = `sys_user.pwd_ver`：
+  `AuthInterceptor` 每个 `/api/**` 请求按主键读一次 `sys_user`，`pv` 与库里不一致、或账号 `status≠1`，一律 401 并写明原因
+  （「密码已修改，请用新密码重新登录」/「账号已被禁用，请重新登录」）。代价是每请求一次主键查询，换来的是改密与禁用**当场**生效，
+  而不是等 TTL 走完——后台只有一个租户，这笔交易划算。
+- 未配 `PLATFORM_JWT_SECRET` 时令牌密钥每次启动随机生成：签名对不上，**重启即所有人掉线**（与主密钥的临时密钥同理），生产必须显式配置。
+- `V6` 迁移加的 `pwd_ver` 默认 0，升级前签发的老令牌没有 `pv` 字段时按 0 处理，不会因为迁移而集体掉线。
+- 改密只允许本人改（`PUT /api/auth/password`，参数只有 `oldPassword`/`newPassword`），不提供管理员代改；
+  原密码不符回 403 且不改库，新密码要求 8-64 位且不得与原密码相同。界面拿到成功就本地清会话跳登录页——
+  此时再调 `/logout` 是用一枚已经作废的令牌。
 - 体验版二维码、审核状态等接口有微信侧频控/日配额，超限报 `45009`/`45011`。
 - `get_audit_status` 只能查最近若干条，历史审核详情以 `wechat_audit_record` 落库记录为准。
 - 「加速审核」每次消耗第三方平台的加急额度，站内不校验剩余额度，超限由微信返回错误码原样提示；
@@ -259,7 +269,7 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
 ## 6. 测试
 
 ```bash
-mvn -B test          # 213 个用例：195 个无需中间件 + 18 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
+mvn -B test          # 223 个用例：204 个无需中间件 + 19 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
 ```
 
 | 测试类 | 锁住的东西 |
@@ -277,8 +287,9 @@ mvn -B test          # 213 个用例：195 个无需中间件 + 18 个连本机 
 | `PlatformDomainServiceTest` | 第三方平台域名白名单：`;` 拼接的裸主机名、两类接口字段名不同（`wxa_server_domain`/`wxa_jump_h5_domain`）、写后必须再 `get`、端口与空清单本地拦住 |
 | `PlatformConfigSerializationTest` | 密钥不进 toString/日志/响应，PUT 的明文密钥能正常绑定 |
 | `PlatformConfigServiceTest` | 单行配置不自动补默认域名（否则 `WECHAT_API_BASE` 失效）、空串能清掉覆盖项、缺字段保持原值 |
-| `PlatformWebContractTest` | Controller 参数绑定、微信 errcode 与 HTTP 状态的映射、分页信封、平台密钥只回掩码 |
-| `PlatformEndToEndTest` | 从扫码授权到发布/灰度/回退的完整链路（桩微信 + 真库表），含操作日志按 `commit`/`release` 等微信接口名精确检索、撤回与加速审核（含不传 `auditId` 的回落）、小程序码在真 MySQL 上的 `MEDIUMBLOB` 字节往返（`V5` 迁移建表 + 第二次读取零微信请求 + `refresh=true` 才回源）、服务类目走完整 HTTP 栈（桩按文档回扁平表 → `GET /all-categories` 仍是组装好的两级树、含 `sensitive_type` 与资质名 → `POST /categories` 发 `{first, second}` 到 `/cgi-bin/wxopen/addcategory`） |
+| `PlatformAuthPasswordTest` | 改密的每条分支与令牌版本作废（8 例）：改密必须重新哈希且 `pwd_ver` +1、原密码不符只回 403 且**一次 update 都不发**、弱长度/与原密码相同/空值三类在本地拦住并回原文案、没有登录上下文时不许改；签发的令牌里 `pv` 与库里一致才放行（含 `pwd_ver` 为 NULL 按 0 处理、账号被禁用回「已被禁用」） |
+| `PlatformWebContractTest` | Controller 参数绑定、微信 errcode 与 HTTP 状态的映射、分页信封、平台密钥只回掩码、`PUT /auth/password` 两个字段能绑进请求体且原密码不符映射成 HTTP 403 |
+| `PlatformEndToEndTest` | 从扫码授权到发布/灰度/回退的完整链路（桩微信 + 真库表），含操作日志按 `commit`/`release` 等微信接口名精确检索、撤回与加速审核（含不传 `auditId` 的回落）、小程序码在真 MySQL 上的 `MEDIUMBLOB` 字节往返（`V5` 迁移建表 + 第二次读取零微信请求 + `refresh=true` 才回源）、服务类目走完整 HTTP 栈（桩按文档回扁平表 → `GET /all-categories` 仍是组装好的两级树、含 `sensitive_type` 与资质名 → `POST /categories` 发 `{first, second}` 到 `/cgi-bin/wxopen/addcategory`）、改密走完整 HTTP 栈（`V6` 的 `pwd_ver` 在真库上生效：改密前签发的令牌再调接口直接 401「密码已修改」、旧密码登不进去、新密码登录后接口才放行，用例跑完把密码还原回默认值） |
 
 已在本机连真库、连真微信域名验证过（2026-11-17）：登录、凭据保存且只回掩码、安全模式的回调 URL 校验与票据推送
 （含签名不符仍回 `success`、`/wx/callback/{appid}` 代收路径）、健康检查真实请求 `api.weixin.qq.com`
@@ -560,6 +571,29 @@ E2E 仍是 18 例但断言全部换到文档形状上；前端 `vue-tsc` + `npm 
 要用 `evaluate_script` 派发 `pointerenter`/`mouseenter`/`mouseover` 才出现第二级菜单，这类「操作发不发请求」的结论一律以日志为准。
 仍未被证明的：真实主体下微信实际下发哪些一级/二级类目（与主体类型、认证范围强相关），以及资质材料上传这条还缺失的链路。
 
+改密这一轮补了 10 例（后端 223 例全绿 = 204 免中间件 + 19 E2E，原 213）。真正的缺陷不是「没有改密接口」而是**改了密码也挡不住旧令牌**：
+登录令牌是无状态签名串，只验签的话，改密与禁用都要等 12 小时 TTL 走完才生效，期间已经发出去的令牌照样能代小程序调微信接口。
+所以 `V6` 给 `sys_user` 加 `pwd_ver`，令牌里带同一份版本号（`pv`），`AuthInterceptor` 每个请求按主键读一次比对——
+`PlatformAuthPasswordTest` 8 例守住分支（原密码不符只回 403 且 `updateById` 一次都不发、弱长度/与原密码相同/空值各自回原文案、
+无登录上下文不许改、`pv` 签发与校验闭环含 `pwd_ver` 为 NULL 按 0 处理），`PlatformWebContractTest` 锁 `PUT /auth/password`
+的字段绑定与 403 映射，`PlatformEndToEndTest` 那条在真 MySQL 上跑完整 HTTP 栈：改密前签发的令牌再调接口直接 401「密码已修改」、
+旧密码登不进去、新密码登录成功且接口放行，用例结束把密码还原回默认值，共享库仍是可用的。
+`pwd_ver` 迁移默认 0，因此升级后老令牌不会集体掉线（没有 `pv` 字段时按 0 解释）。
+
+浏览器实测（桩把 `AuthInterceptor` 的规则照抄成「除 `/auth/login` 外一律先查会话死活」）：账号下拉三项都带线性图标，
+「修改密码」弹窗 440px、顶部黄条写着「保存后当前登录立即失效，需要用新密码重新登录。」、三个字段的
+`autocomplete` 分别是 `current-password`/`new-password`/`new-password`；空提交只出三条必填提示且 `uistub-access.log` 零请求，
+`abc` 触发「新密码长度需为 8-64 位」、与原密码相同触发「新密码不能与原密码相同」、两次不一致触发「两次输入的新密码不一致」；
+原密码填错时只有 1 条 error toast「原密码不正确」、弹窗不关、会话不变，出站 body 精确是 `{"oldPassword":"…","newPassword":"…"}`——
+确认框那一份不参与提交；改成功后 1 条 success toast「密码已修改，请用新密码重新登录」、弹窗从 DOM 销毁、
+`wx_platform_token` 与 `wx_platform_user` 一起清空、地址栏变 `/login`。用旧密码登录时登录页内联显示「用户名或密码错误」，
+这一句是本轮顺带修的：请求层原先把所有 401 一律改写成「登录状态已失效，请重新登录」，把后端已经写清的原因（密码已修改 /
+账号已禁用 / 登录已过期）全冲掉，改成有 `message` 就用它、没有才兜底。另外演了一次「还开着的页签」：令牌已废时整页加载
+`/authorizers` → 401 → 令牌清掉并跳 `/login?redirect=%2Fauthorizers`，用新密码登录后按 `redirect` 回到列表。
+本轮踩到的测量坑要记下来：页签处于 `visibilityState=hidden` 时 CSS 动画不跑，Element Plus 的 `el-zoom-in-top`
+leave 过渡永远不结束，于是校验错误节点会以 `opacity:0`、高度 0 的形式滞留在 DOM 里——只看 `.el-form-item__error` 是否存在
+就会误判「错误提示清不掉」，读数必须按 `getComputedStyle(...).opacity` 与实际高度过滤（`is-success` 类与 `form.validate()` 返回 `true` 才是状态真相）。
+
 仍只能等真实凭据与备案域名才能验证：真实 `component_appid`/`component_secret` 换取 token、出口 IP 白名单（缺失报 `40164`）、
 公网 https 备案域名的微信侧校验、已备案小程序才允许发布、宿主机 nginx 的证书链与 `/wx/` 透传（compose 已不含 caddy）。
 第三方平台的加急额度余量也没有可查接口，用超了只能等微信返回错误码。
@@ -571,9 +605,11 @@ E2E 仍是 18 例但断言全部换到文档形状上；前端 `vue-tsc` + `npm 
 
 0. **部署自检**：`curl https://<域名>/wx/health` 回 `ok` —— 同时证明 api 镜像是重新构建的、宿主机 nginx 的 `/wx/` 透传正常；
    `docker compose logs api` 里不该再有每 30 秒一条的 `timestamp` 缺参异常，业务失败现在都是一行 `业务异常 ... message=...`。
-   若小程序码报「后端没有这个接口」，就是 `docker compose build api` 没跑或没生效。
+   若小程序码报「后端没有这个接口」，就是 `docker compose build api` 没跑或没生效。日志里还应看到 Flyway 把架构升到 `6 - sys user pwd ver`；
+   没跑这一条迁移，改密就只能挡住「新的一次登录」，旧令牌照旧活到 TTL。
 1. **凭据落库 + 票据**：按 `deploy/docker-compose.yml` 的 `environment` 列出哪些要填，在 `deploy/` 下本地新建 env 填真实
    `component_appid`/`component_secret`/消息加解密密钥与 `aes_key`（仓库里不放 env 文件，也不要把密钥抄进任何提交物），
+   同一份 env 里 `PLATFORM_JWT_SECRET` 也要填——留空时登录令牌的密钥每次启动随机生成，**每次重启所有人都得重新登录**。
    起整栈后看「平台配置」页 `secretSet/messageTokenSet/aesKeySet` 全为真、`ticketFresh` 为真。
    票据 20 分钟内没推来就是「授权事件接收 URL」在微信后台填错或回调不通，`/api/platform/health` 的 `configReady` 会是 false。
 2. **出口 IP 白名单**：「平台配置 → IP 白名单」填部署机公网 IP（容器出口 IP，不是宿主机内网 IP）。

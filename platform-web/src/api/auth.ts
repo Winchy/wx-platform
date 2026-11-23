@@ -1,4 +1,4 @@
-import { get, post } from '@/utils/request'
+import { get, post, put } from '@/utils/request'
 
 export interface LoginParams {
   username: string
@@ -26,6 +26,19 @@ export function login(params: LoginParams): Promise<LoginResult> {
 
 export function fetchCurrentUser(): Promise<UserInfo> {
   return get<UserInfo>('/auth/me')
+}
+
+export interface ChangePasswordParams {
+  oldPassword: string
+  newPassword: string
+}
+
+/**
+ * 改密成功即 pwd_ver +1，**这次请求用的令牌也同时失效**，
+ * 所以不让 401 自动跳转（那会把「请用新密码重新登录」的提示冲掉），由调用方自己清会话。
+ */
+export function changePassword(params: ChangePasswordParams): Promise<null> {
+  return put<null>('/auth/password', params, { skipAuthRedirect: true })
 }
 
 export function logout(): Promise<null> {

@@ -19,6 +19,7 @@ public class AuthInterceptor implements HandlerInterceptor {
     private static final String BEARER = "Bearer ";
 
     private final TokenService tokenService;
+    private final SysUserMapper userMapper;
     private final ObjectMapper objectMapper;
 
     @Override
@@ -41,6 +42,22 @@ public class AuthInterceptor implements HandlerInterceptor {
         RequestContext.Principal principal = tokenService.verify(token);
         if (principal == null) {
             reject(response, 401, "登录已过期，请重新登录");
+            return false;
+        }
+        // 令牌是无状态签名，只验签的话「改了密码」与「禁用了账号」都要等 TTL 到期才生效；
+        // 这里按主键多读一次（后台单租户、每请求一次 PK 查询），换取改密/禁用当场失效。
+        SysUser user = userMapper.selectById(principal.id());
+        if (user == null) {
+            reject(response, 401, "账号不存在，请重新登录");
+            return false;
+        }
+        if (user.getStatus() == null || user.getStatus() != 1) {
+            reject(response, 401, "账号已被禁用，请重新登录");
+            return false;
+        }
+        int pwdVer = user.getPwdVer() == null ? 0 : user.getPwdVer();
+        if (pwdVer != principal.pwdVer()) {
+            reject(response, 401, "密码已修改，请用新密码重新登录");
             return false;
         }
         RequestContext.set(principal);

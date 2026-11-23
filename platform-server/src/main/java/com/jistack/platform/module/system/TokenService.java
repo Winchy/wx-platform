@@ -46,6 +46,7 @@ public class TokenService {
                 "uid", principal.id(),
                 "sub", principal.username(),
                 "role", principal.role(),
+                "pv", principal.pwdVer(),
                 "exp", Instant.now().getEpochSecond() + ttlSeconds)));
         String content = header + "." + payload;
         return content + "." + base64Url(hmac(content));
@@ -73,7 +74,8 @@ public class TokenService {
         return new RequestContext.Principal(
                 node.path("uid").asLong(),
                 node.path("sub").asText(),
-                node.path("role").asText("OPERATOR"));
+                node.path("role").asText("OPERATOR"),
+                node.path("pv").asInt(0));
     }
 
     public long ttlSeconds() {

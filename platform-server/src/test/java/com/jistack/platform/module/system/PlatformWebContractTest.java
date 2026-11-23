@@ -31,6 +31,7 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -54,6 +55,7 @@ class PlatformWebContractTest {
     private ReleaseService releaseService;
     private MiniProgramSettingService settingService;
     private WeChatCallbackService callbackService;
+    private AuthService authService;
     private MockMvc mvc;
 
     @BeforeEach
@@ -63,9 +65,11 @@ class PlatformWebContractTest {
         releaseService = mock(ReleaseService.class);
         settingService = mock(MiniProgramSettingService.class);
         callbackService = mock(WeChatCallbackService.class);
+        authService = mock(AuthService.class);
         mvc = MockMvcBuilders
                 .standaloneSetup(new PlatformConfigController(configService, authorizerService),
                         new AuthorizerController(authorizerService),
+                        new AuthController(authService),
                         new ReleaseController(releaseService),
                         new MiniProgramSettingController(settingService),
                         new WechatCallbackController(callbackService,
@@ -94,6 +98,29 @@ class PlatformWebContractTest {
         verify(configService).update(captor.capture());
         assertThat(captor.getValue().getComponentSecret()).isEqualTo("plain-secret");
         assertThat(captor.getValue().getEncodingAesKey()).hasSize(43);
+    }
+
+    @Test
+    @DisplayName("PUT /api/auth/password：两个字段能绑进请求体，原密码不符回 403")
+    void changePasswordBindingAndStatus() throws Exception {
+        mvc.perform(put("/api/auth/password").contentType(MediaType.APPLICATION_JSON).content("""
+                {"oldPassword":"admin123","newPassword":"NewPass2026"}
+                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0));
+
+        ArgumentCaptor<ChangePasswordRequest> captor = ArgumentCaptor.forClass(ChangePasswordRequest.class);
+        verify(authService).changePassword(captor.capture());
+        assertThat(captor.getValue().oldPassword()).isEqualTo("admin123");
+        assertThat(captor.getValue().newPassword()).isEqualTo("NewPass2026");
+
+        doThrow(BizException.forbidden("原密码不正确")).when(authService).changePassword(any());
+        mvc.perform(put("/api/auth/password").contentType(MediaType.APPLICATION_JSON).content("""
+                {"oldPassword":"wrong","newPassword":"NewPass2026"}
+                """))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value(403))
+                .andExpect(jsonPath("$.message").value("原密码不正确"));
     }
 
     @Test
