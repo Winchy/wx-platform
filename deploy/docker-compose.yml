@@ -59,6 +59,15 @@ services:
       PLATFORM_SITE_BASE: https://${PLATFORM_DOMAIN}
       # 微信接口基地址；不在 .env 里设就是官方域名，走自建代理出口时才需要改
       WECHAT_API_BASE: ${WECHAT_API_BASE:-https://api.weixin.qq.com}
+      # 阿里云短信验证码。ENABLED 为 false 时验证码只打进日志，正式环境要 true 并填齐 .env 里那四项
+      PLATFORM_SMS_ENABLED: ${PLATFORM_SMS_ENABLED:-false}
+      PLATFORM_SMS_ACCESS_KEY_ID: ${PLATFORM_SMS_ACCESS_KEY_ID:-}
+      PLATFORM_SMS_ACCESS_KEY_SECRET: ${PLATFORM_SMS_ACCESS_KEY_SECRET:-}
+      PLATFORM_SMS_SIGN_NAME: ${PLATFORM_SMS_SIGN_NAME:-}
+      PLATFORM_SMS_TEMPLATE_CODE: ${PLATFORM_SMS_TEMPLATE_CODE:-}
+      PLATFORM_SMS_ENDPOINT: ${PLATFORM_SMS_ENDPOINT:-https://dysmsapi.aliyuncs.com/}
+      PLATFORM_SMS_REGION: ${PLATFORM_SMS_REGION:-cn-hangzhou}
+      PLATFORM_SMS_TEMPLATE_PARAM_KEY: ${PLATFORM_SMS_TEMPLATE_PARAM_KEY:-code}
       TZ: Asia/Shanghai
 
   # TLS 由宿主机上已有的 nginx 终止，这里只把 web 暴露到本机回环地址，

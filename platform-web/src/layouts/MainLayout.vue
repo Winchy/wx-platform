@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, type Component } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import {
@@ -10,6 +10,7 @@ import {
   Expand,
   Fold,
   Histogram,
+  Iphone,
   Link,
   List,
   Lock,
@@ -22,9 +23,11 @@ import {
   User
 } from '@element-plus/icons-vue'
 
-import { changePassword } from '@/api/auth'
+import { bindPhone, changePassword, sendBindCode, unbindPhone } from '@/api/auth'
 import { FormDialog } from '@/components'
 import { useAuthStore } from '@/stores/auth'
+import { cooldownSecondsOf, describeError } from '@/utils/request'
+import { normalizePhone } from '@/utils/phone'
 
 interface MenuEntry {
   path: string
@@ -189,11 +192,142 @@ async function onSubmitPassword(): Promise<void> {
   }
 }
 
+const phoneVisible = ref(false)
+const phoneSubmitting = ref(false)
+const unbinding = ref(false)
+const codeSending = ref(false)
+const phoneCooldown = ref(0)
+const phoneError = ref('')
+const phoneFormRef = ref<FormInstance>()
+const phoneForm = reactive({ phone: '', code: '', password: '' })
+
+const boundPhone = computed(() => auth.user?.phoneMasked ?? '')
+
+const phoneRules: FormRules<typeof phoneForm> = {
+  phone: [
+    { required: true, message: '请输入要绑定的手机号', trigger: 'blur' },
+    {
+      validator: (_rule, value, callback) => {
+        callback(value && normalizePhone(String(value)) ? undefined : new Error('请输入 11 位内地手机号'))
+      },
+      trigger: 'blur'
+    }
+  ],
+  code: [
+    { required: true, message: '请输入验证码', trigger: 'blur' },
+    { pattern: /^\d{6}$/, message: '验证码是 6 位数字', trigger: 'blur' }
+  ],
+  password: [{ required: true, message: '请输入当前账号密码', trigger: 'blur' }]
+}
+
+let phoneTimer: ReturnType<typeof setInterval> | undefined
+
+function startPhoneCooldown(seconds: number): void {
+  phoneCooldown.value = Math.max(1, Math.ceil(seconds))
+  if (phoneTimer) clearInterval(phoneTimer)
+  phoneTimer = setInterval(() => {
+    phoneCooldown.value -= 1
+    if (phoneCooldown.value <= 0 && phoneTimer) {
+      clearInterval(phoneTimer)
+      phoneTimer = undefined
+    }
+  }, 1000)
+}
+
+onBeforeUnmount(() => {
+  if (phoneTimer) clearInterval(phoneTimer)
+})
+
+function openPhoneDialog(): void {
+  phoneForm.phone = ''
+  phoneForm.code = ''
+  phoneForm.password = ''
+  phoneError.value = ''
+  phoneVisible.value = true
+}
+
+async function onSendBindCode(): Promise<void> {
+  const phone = normalizePhone(phoneForm.phone)
+  if (!phone) {
+    phoneError.value = '请先填写正确的手机号'
+    return
+  }
+  phoneForm.phone = phone
+  phoneError.value = ''
+  codeSending.value = true
+  try {
+    const result = await sendBindCode(phone)
+    startPhoneCooldown(result?.cooldownSeconds || 60)
+    ElMessage.success('验证码已发送')
+  } catch (error) {
+    const seconds = cooldownSecondsOf(error)
+    if (seconds !== null) {
+      startPhoneCooldown(seconds)
+      phoneError.value = `验证码发送过于频繁，请 ${seconds} 秒后再试`
+    } else {
+      phoneError.value = describeError(error)
+    }
+  } finally {
+    codeSending.value = false
+  }
+}
+
+async function onSubmitBind(): Promise<void> {
+  const form = phoneFormRef.value
+  if (form) {
+    try {
+      await form.validate()
+    } catch {
+      return
+    }
+  }
+  const phone = normalizePhone(phoneForm.phone)
+  if (!phone) {
+    phoneError.value = '请输入 11 位内地手机号'
+    return
+  }
+  phoneSubmitting.value = true
+  phoneError.value = ''
+  try {
+    await bindPhone({ phone, code: phoneForm.code.trim(), password: phoneForm.password })
+    phoneVisible.value = false
+    // 绑定不动 pwd_ver，当前令牌依旧有效，只要把脱敏号重新拉回来回显
+    await auth.loadUser()
+    ElMessage.success('手机号已绑定，下次可用验证码登录')
+  } catch (error) {
+    // 原密码不正确 / 验证码错 / 号码已被别的账号占用（409）：接口是 silent 的，只落在弹窗里
+    phoneError.value = describeError(error)
+  } finally {
+    phoneSubmitting.value = false
+  }
+}
+
+async function onUnbind(): Promise<void> {
+  if (!phoneForm.password) {
+    phoneError.value = '解绑需要输入当前账号密码'
+    return
+  }
+  unbinding.value = true
+  phoneError.value = ''
+  try {
+    await unbindPhone(phoneForm.password)
+    phoneVisible.value = false
+    await auth.loadUser()
+    ElMessage.success('手机号已解绑，该号码不能再用于验证码登录')
+  } catch (error) {
+    phoneError.value = describeError(error)
+  } finally {
+    unbinding.value = false
+  }
+}
+
 function onCommand(command: string): void {
   if (command === 'logout') {
     void onLogout()
   } else if (command === 'password') {
     openPasswordDialog()
+  } else if (command === 'phone') {
+    openPhoneDialog()
   } else if (command === 'settings') {
     void router.push('/settings/platform')
   }
@@ -262,6 +396,7 @@ function onCommand(command: string): void {
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item command="password" :icon="Lock">修改密码</el-dropdown-item>
+                <el-dropdown-item command="phone" :icon="Iphone">手机号登录</el-dropdown-item>
                 <el-dropdown-item command="settings" :icon="Setting">平台配置</el-dropdown-item>
                 <el-dropdown-item divided command="logout" :icon="SwitchButton">退出登录</el-dropdown-item>
               </el-dropdown-menu>
@@ -293,6 +428,7 @@ function onCommand(command: string): void {
         :closable="false"
         show-icon
         title="保存后当前登录立即失效，需要用新密码重新登录。"
+        description="改密码不会解绑手机号，所以也可以用「手机号 + 验证码」重新登录。"
       />
       <el-form ref="pwdFormRef" :model="pwdForm" :rules="pwdRules" label-width="92px" @submit.prevent>
         <el-form-item label="原密码" prop="oldPassword">
@@ -324,6 +460,66 @@ function onCommand(command: string): void {
           />
         </el-form-item>
       </el-form>
+    </FormDialog>
+
+    <FormDialog
+      v-model="phoneVisible"
+      title="手机号登录"
+      width="460px"
+      confirm-text="保存绑定"
+      :loading="phoneSubmitting"
+      @confirm="onSubmitBind"
+    >
+      <el-alert
+        class="layout__pwd-alert"
+        :type="boundPhone ? 'success' : 'info'"
+        :closable="false"
+        show-icon
+        :title="boundPhone ? `当前已绑定 ${boundPhone}` : '尚未绑定手机号'"
+        :description="boundPhone
+          ? '填新号码 + 验证码可换绑；只想停用手机号登录，点下方「解绑手机号」。'
+          : '绑定后即可用手机号 + 验证码登录，不必每次输密码。'"
+      />
+      <el-form ref="phoneFormRef" :model="phoneForm" :rules="phoneRules" label-width="92px" @submit.prevent>
+        <el-form-item label="手机号" prop="phone">
+          <el-input v-model="phoneForm.phone" placeholder="11 位手机号" autocomplete="tel" clearable />
+        </el-form-item>
+        <el-form-item label="验证码" prop="code">
+          <div class="layout__phone-code">
+            <el-input
+              v-model="phoneForm.code"
+              placeholder="6 位验证码"
+              maxlength="6"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+            />
+            <el-button
+              class="layout__phone-code-btn"
+              :disabled="phoneCooldown > 0"
+              :loading="codeSending"
+              @click="onSendBindCode"
+            >
+              {{ phoneCooldown > 0 ? `${phoneCooldown} 秒后重发` : '获取验证码' }}
+            </el-button>
+          </div>
+        </el-form-item>
+        <el-form-item label="当前密码" prop="password">
+          <el-input
+            v-model="phoneForm.password"
+            type="password"
+            show-password
+            autocomplete="current-password"
+            placeholder="绑定与解绑都要验证当前密码"
+          />
+        </el-form-item>
+      </el-form>
+      <el-alert v-if="phoneError" class="layout__pwd-alert" type="error" :closable="false" show-icon :title="phoneError" />
+      <p class="layout__phone-note">一个手机号只能绑一个账号；验证码 5 分钟内有效，同一号码 60 秒只能发一次。</p>
+      <template #footer-left>
+        <el-button v-if="boundPhone" text type="danger" :disabled="phoneSubmitting" :loading="unbinding" @click="onUnbind">
+          解绑手机号
+        </el-button>
+      </template>
     </FormDialog>
   </el-container>
 </template>
@@ -454,5 +650,28 @@ function onCommand(command: string): void {
 
 .layout__pwd-alert {
   margin-bottom: 16px;
+}
+
+.layout__phone-code {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+}
+
+.layout__phone-code .el-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.layout__phone-code-btn {
+  width: 116px;
+  flex-shrink: 0;
+}
+
+.layout__phone-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--app-text-muted);
+  line-height: 1.6;
 }
 </style>

@@ -364,4 +364,113 @@ class PlatformWebContractTest {
                 .andExpect(jsonPath("$.code").value(ApiResponse.OK))
                 .andExpect(jsonPath("$.data").isArray());
     }
+
+    @Test
+    @DisplayName("POST /api/auth/sms-code：手机号绑定得上，来源 IP 由容器传给服务端做限流")
+    void smsCodeBindingAndClientIp() throws Exception {
+        when(authService.issueLoginCode("13800138000", "127.0.0.1")).thenReturn(new SmsCodeResult(60, 300));
+
+        mvc.perform(post("/api/auth/sms-code").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"phone\":\"13800138000\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.cooldownSeconds").value(60))
+                .andExpect(jsonPath("$.data.expiresIn").value(300));
+
+        // 限流按来源 IP 计数，取不到 IP 就等于没有这道闸
+        verify(authService).issueLoginCode("13800138000", "127.0.0.1");
+    }
+
+    @Test
+    @DisplayName("POST /api/auth/login-sms：两个字段都能绑定，错码走 401 而不是 400")
+    void smsLoginBindingAndUnauthorized() throws Exception {
+        when(authService.loginBySms(new SmsLoginRequest("13800138000", "246813"))).thenReturn(
+                new LoginResponse("sms-token", 43200,
+                        new UserVO(1L, "admin", "管理员", "ADMIN", "138****8000")));
+
+        mvc.perform(post("/api/auth/login-sms").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"phone\":\"13800138000\",\"code\":\"246813\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.token").value("sms-token"))
+                .andExpect(jsonPath("$.data.user.phoneMasked").value("138****8000"))
+                .andExpect(jsonPath("$.data.user.passwordHash").doesNotExist());
+
+        doThrow(BizException.unauthorized("手机号或验证码不正确"))
+                .when(authService).loginBySms(new SmsLoginRequest("13800138000", "000000"));
+        mvc.perform(post("/api/auth/login-sms").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"phone\":\"13800138000\",\"code\":\"000000\"}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value(401))
+                .andExpect(jsonPath("$.message").value("手机号或验证码不正确"));
+    }
+
+    @Test
+    @DisplayName("429/409/502 只在信封里，HTTP 统一 400：前端按 code 分支，不能按状态码")
+    void envelopeOnlyCodesMapToHttp400() throws Exception {
+        // 改桩时要走 doThrow：when(mock.x()) 会真的调用一次，把上一条桩里备好的异常先抛出来
+        doThrow(new BizException(429, "验证码发送过于频繁，请 37 秒后再试"))
+                .when(authService).issueLoginCode(any(), any());
+        mvc.perform(post("/api/auth/sms-code").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"phone\":\"13800138000\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value(429))
+                .andExpect(jsonPath("$.message", org.hamcrest.Matchers.containsString("37 秒")));
+
+        doThrow(new BizException(409, "该手机号已绑定其他账号")).when(authService).bindPhone(any());
+        mvc.perform(put("/api/auth/phone").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"phone\":\"13800138000\",\"code\":\"246813\",\"password\":\"admin123\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value(409));
+
+        doThrow(new BizException(502, "验证码发送失败，请稍后重试"))
+                .when(authService).issueLoginCode(any(), any());
+        mvc.perform(post("/api/auth/sms-code").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"phone\":\"13800138000\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value(502))
+                .andExpect(jsonPath("$.message").value("验证码发送失败，请稍后重试"));
+    }
+
+    @Test
+    @DisplayName("绑定/解绑请求体：phone+code+password 与 password 都能绑上")
+    void phoneBindingRoutes() throws Exception {
+        mvc.perform(put("/api/auth/phone").contentType(MediaType.APPLICATION_JSON).content("""
+                {"phone":"13800138000","code":"246813","password":"admin123"}
+                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0));
+        ArgumentCaptor<BindPhoneRequest> bind = ArgumentCaptor.forClass(BindPhoneRequest.class);
+        verify(authService).bindPhone(bind.capture());
+        assertThat(bind.getValue().phone()).isEqualTo("13800138000");
+        assertThat(bind.getValue().code()).isEqualTo("246813");
+        assertThat(bind.getValue().password()).isEqualTo("admin123");
+
+        mvc.perform(post("/api/auth/phone/sms-code").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"phone\":\"13800138000\"}"))
+                .andExpect(status().isOk());
+        verify(authService).issueBindCode("13800138000", "127.0.0.1");
+
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                        .delete("/api/auth/phone").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"password\":\"admin123\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0));
+        ArgumentCaptor<UnbindPhoneRequest> unbind = ArgumentCaptor.forClass(UnbindPhoneRequest.class);
+        verify(authService).unbindPhone(unbind.capture());
+        assertThat(unbind.getValue().password()).isEqualTo("admin123");
+    }
+
+    @Test
+    @DisplayName("探测公开取码接口：body 残缺只回 400 固定文案，不带出解析器原文")
+    void malformedBodyOnPublicSmsEndpointIsNotA500() throws Exception {
+        mvc.perform(post("/api/auth/sms-code").contentType(MediaType.APPLICATION_JSON).content("{oops"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value(400))
+                .andExpect(jsonPath("$.message").value("请求体缺失或不是合法的 JSON"));
+        mvc.perform(post("/api/auth/sms-code").contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value("请求体缺失或不是合法的 JSON"));
+
+        verify(authService, never()).issueLoginCode(any(), any());
+    }
 }

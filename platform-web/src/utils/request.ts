@@ -258,3 +258,15 @@ export function describeErrorDetail(error: unknown): string {
   }
   return ''
 }
+
+/**
+ * 命中验证码发送冷却时返回剩余秒数，否则返回 null。
+ * 业务码 429 只在响应包装里（HTTP 仍是 400），所以判 err.code 是没用的，得看 payload.code。
+ */
+export function cooldownSecondsOf(error: unknown): number | null {
+  if (!(error instanceof ApiError)) return null
+  const envelope = error.payload as ApiEnvelope<unknown> | undefined
+  if (envelope?.code !== 429) return null
+  const matched = /(\d+)\s*秒后再试/.exec(error.message)
+  return matched ? Number(matched[1]) : 60
+}

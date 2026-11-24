@@ -21,9 +21,11 @@ public class WebConfig implements WebMvcConfigurer {
 
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
+        // 免鉴权只有这三条：密码登录、取登录验证码、验证码登录。
+        // /api/auth/phone/** 是「给账号加一条免密码登录通道」，必须带令牌，故意不放行。
         registry.addInterceptor(authInterceptor)
                 .addPathPatterns("/api/**")
-                .excludePathPatterns("/api/auth/login");
+                .excludePathPatterns("/api/auth/login", "/api/auth/sms-code", "/api/auth/login-sms");
     }
 
     @Override

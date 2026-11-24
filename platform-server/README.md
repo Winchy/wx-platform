@@ -26,6 +26,8 @@ cd platform-server && mvn -B spring-boot:run   # Flyway 自动建表，首次写
 
 默认账号 `admin / admin123`，登录后请立刻改密：顶栏账号下拉 →「修改密码」（`sys_user.password_hash` 存 BCrypt，
 改完此前签发的所有登录令牌当场失效，需要用新密码重新登录）。
+登录页有「账号密码」与「手机号验证码」两个页签；后者要先在后台右上角「手机号登录」里绑定号码，且号码能否真收到验证码
+取决于短信通道是否配好——未配时验证码只进日志不外发，见 §1-5。
 
 ```bash
 cd platform-web && npm ci        # Node 需 ≥20，仓库带 .nvmrc=24：nvm use
@@ -41,10 +43,11 @@ npm run build                    # vue-tsc --noEmit + vite build，产物 dist/
 cd platform-server && mvn -B test
 ```
 
-- 204 个用例不需要任何中间件：安全模式加解密闭环、MockWebServer 锁定的微信接口契约（路径/字段名/请求体/分帧方式）、
+- 250 个用例不需要任何中间件：安全模式加解密闭环、MockWebServer 锁定的微信接口契约（路径/字段名/请求体/分帧方式）、
   发布链路状态机（commit→提审→审核→发布/灰度/回退）、令牌链刷新与轮换回写、改密与登录令牌的版本作废、回调分发（含不带参数探测）、
-  图片直链抓取失败分型、微信接口域名的优先级、Web 层参数绑定与错误码映射。
-- 19 个 `PlatformEndToEndTest` 只在 3306 与 6379 都能连上时才执行（`@EnabledIf("infrastructureReady")`）。
+  图片直链抓取失败分型、微信接口域名的优先级、Web 层参数绑定与错误码映射、
+  阿里云短信签名（对官方签名器的黄金向量）与 SendSms 出站契约、验证码的冷却/限额/一次一废、手机号登录与绑定的每条分支。
+- 20 个 `PlatformEndToEndTest` 只在 3306 与 6379 都能连上时才执行（`@EnabledIf("infrastructureReady")`）。
   它们用随机库名 `wxplat_e2e_*` + Redis db9，跑完 drop，不污染开发数据；微信侧由 MockWebServer 桩出来，
   不需要真实凭据、也不需要公网域名。没起容器时这些用例显示 skipped，不是失败。
 
@@ -118,6 +121,132 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
 > 挂 `./Caddyfile:/etc/caddy/Caddyfile:ro`，传 `PLATFORM_DOMAIN` 环境变量给文件里的 `{$PLATFORM_DOMAIN}`）即可自动签证书，
 > 文件内容只有 `{$PLATFORM_DOMAIN} { reverse_proxy web:80 }` 一行；此时把 web 的 `127.0.0.1:8088:80` 去掉，别留两个入口。
 
+### 5) 手机号验证码登录（阿里云短信）配置步骤
+
+登录页有两个页签：「账号密码」与「手机号验证码」。手机号这条通道要真的能用，需要阿里云短信服务加 5 项配置，按下面顺序做。
+
+**没配也能开发**：`platform.sms.enabled` 默认 `false`，此时验证码照常签发、照常进 Redis、照常一次一废，只是不真发短信，
+明文码打进 api 日志（`LoggingSmsSender`）：
+
+```bash
+docker compose logs api | grep "短信通道未启用"
+# 短信通道未启用（platform.sms.enabled=false），验证码不发送，仅记录：phone=138****8000 code=246810 —— …
+```
+
+> 这条兜底只为本地与没有凭据的环境。**正式环境必须置 `true`**：否则没人收到短信，而验证码留在服务器日志里——
+> 日志被采集/转发出去的那一天，等于把登录口令写进了日志。
+
+**第 1 步 开通短信服务 + 资质**
+
+控制台 `dysms.console.aliyun.com`，首次进入按提示开通服务。国内短信要求先有**审核通过的资质**：
+「国内消息 → 资质管理」提交主体材料（企业营业执照等），它是签名与模板的前置，没有它后两步提交不了。
+签名要能对应到提交资质的那个主体，个人主体在验证码场景审核更严，实践中多用企业主体（材料清单与要求以控制台当前页面为准）。
+
+**第 2 步 创建签名**
+
+「国内消息 → 签名管理 → 添加签名」，关联上一步的资质。
+
+- 签名名称**填不带 `【】` 的裸名称**（如 `极栈科技`）：控制台展示时自己加书名号，`SignName` 参数也传裸名称，
+  带上括号会报 `isv.SMS_SIGNATURE_ILLEGAL`（账号下找不到对应签名）。
+- 名称要能对应到你的主体/网站/App，随意起的名一般过不了审。
+- 状态为「审核通过」后才可用，且 `.env` 里填的名称要与控制台**逐字一致**（空格、括号、大小写都算）。
+
+**第 3 步 创建模板**
+
+「国内消息 → 模板管理 → 添加模板」，模板类型选**验证码**，正文例如：
+
+```text
+您的验证码为${code}，5分钟内有效，请勿泄露。
+```
+
+- 验证码模板**只允许一个变量**（阿里云侧规则，多变量报 `template_parameter_count_illegal`）。
+- 变量名不必叫 `code`，取决于你写的是 `${code}` 还是 `${num}`：后者需设 `PLATFORM_SMS_TEMPLATE_PARAM_KEY=num`，
+  否则报 `isv.TEMPLATE_MISSING_PARAMETERS` / `isv.TEMPLATE_PARAMS_ILLEGAL`。
+  本站生成的是 6 位纯数字（`String.format("%06d", …)`），符合验证码模板对变量内容的限制；模板正文里不能夹带链接或营销语句。
+- 审核通过后记下**模板 Code**（形如 `SMS_123456789`）填进 `.env`；模板正文改了要重新审核。
+
+**第 4 步 只授短信权限的 RAM 子账号**
+
+不要用主账号的 AccessKey。RAM 控制台 `ram.console.aliyun.com`：
+
+1. 「用户 → 创建用户」，访问方式勾 **OpenAPI 调用**。
+2. 「添加权限」只给系统策略 **`AliyunDysmsFullAccess`**（给 `…ReadOnlyAccess` 能查记录但发不出短信，会报 `isp.RAM_PERMISSION_DENY`）。
+3. 「创建 AccessKey」，**Secret 只在创建那一次显示**，立刻存进密码管理器。
+4. 可选加固：给该子账号的权限加 `acs:SourceIp` 条件，把调用来源限制到服务器出口 IP——密钥泄露后也只在那台机器上可用。
+
+**第 5 步 写进 `deploy/.env` 并重启 api**
+
+`deploy/.env.example` 已经有这段的变量名，`.env` 里填值（`.env` 含密钥，不要提交到仓库）：
+
+```bash
+PLATFORM_SMS_ENABLED=true
+PLATFORM_SMS_ACCESS_KEY_ID=LTAI5t…          # RAM 子账号，不是主账号
+PLATFORM_SMS_ACCESS_KEY_SECRET=…
+PLATFORM_SMS_SIGN_NAME=极栈科技               # 不带【】，与控制台逐字一致
+PLATFORM_SMS_TEMPLATE_CODE=SMS_123456789
+```
+
+compose 已把这 5 项（外加可选的 `PLATFORM_SMS_ENDPOINT` / `PLATFORM_SMS_REGION` / `PLATFORM_SMS_TEMPLATE_PARAM_KEY`）
+透传给 `api`，改完 `docker compose up -d api` 即可（环境变量变了会重建容器，不需要 `--build`）。
+本机开发用同名 `export` 再 `mvn -B spring-boot:run`。容器要能出网访问 `dysmsapi.aliyuncs.com:443`；
+安全组默认放行出方向就够了，有出网代理的机器另配。
+
+**第 6 步 验证**
+
+1. 密码登录 → 右上角账号下拉 →「手机号登录」→ 填手机号 + 验证码 + **当前密码** → 绑定。
+   绑定要两道凭据是刻意的：手机号是一条不需要密码的登录通道，只凭被偷来的会话就能把它加上，等于把账号交给攻击者。
+2. 退出 → 登录页切到「手机号验证码」→ 用刚绑的号码与收到的码登录。
+3. 服务端两侧留痕：
+
+   ```bash
+   docker compose logs api | grep -E "验证码已签发|验证码短信已提交阿里云|验证码短信发送失败"
+   # 验证码已签发 phone=138****8000 purpose=LOGIN 当日第 1 次
+   # 验证码短信已提交阿里云 phone=138****8000 signName=极栈科技 templateCode=SMS_123456789 bizId=9006… requestId=F655…
+   ```
+
+   拿到 `bizId` 说明阿里云**已受理**（受理 ≠ 用户已收到，最终投递在控制台「发送记录查询」按 `bizId` 看）；
+   仍是「短信通道未启用」说明 `PLATFORM_SMS_ENABLED` 没生效；
+   界面只回「验证码发送失败，请稍后重试」时，真实原因（阿里云的 `Code` 与 `Message`）在那行 `验证码短信发送失败` 的 ERROR 里——
+   供应商原文只进日志，不进响应。
+
+**第 7 步 排错对照（阿里云响应里的 `Code`）**
+
+| Code | 含义 / 处置 |
+| --- | --- |
+| `isv.SMS_SIGNATURE_ILLEGAL` | 账号下找不到这个签名：名称带上了 `【】`、与控制台不一致，或签名不属于这个 AccessKey 所在的账号 |
+| `isv.SIGN_STATE_ILLEGAL` | 签名被停用/状态不可用，回控制台看签名状态 |
+| `isv.SMS_TEMPLATE_ILLEGAL` | 模板 Code 填错，或模板未审核通过、与签名不在同一账号 |
+| `isv.TEMPLATE_MISSING_PARAMETERS`、`isv.TEMPLATE_PARAMS_ILLEGAL`、`template_parameter_count_illegal` | 变量名对不上（改 `PLATFORM_SMS_TEMPLATE_PARAM_KEY`），或模板用了多个变量 |
+| `isv.MOBILE_NUMBER_ILLEGAL` | 号码格式不对。本站服务端已把号码归一成 11 位裸号（`+86 138 0013 8000` → `13800138000`），出现这条基本是境外号——该功能只支持中国大陆号码 |
+| `SignatureDoesNotMatch` | AccessKey Secret 不对 |
+| `InvalidTimeStamp.Expired` | 服务器 UTC 时间偏差过大，修 NTP |
+| `SignatureNonceUsed` | nonce 重复（本站每次请求重新生成，出现时怀疑网关重放） |
+| `isv.INVALID_PARAMETERS` | 参数被网关改写（常见于中间层加了签名外的字段） |
+| `isp.RAM_PERMISSION_DENY` | 子账号缺 `AliyunDysmsFullAccess` |
+| `isv.ACCOUNT_NOT_EXISTS` | 短信服务未开通，或 AK 属于另一个账号 |
+| `isv.AMOUNT_NOT_ENOUGH`、`isv.OUT_OF_SERVICE` | 余额不足 / 业务被停，先充值或恢复 |
+| `isv.BUSINESS_LIMIT_CONTROL`、`isv.DAY_LIMIT_CONTROL`、`isv.MONTH_LIMIT_CONTROL` | 阿里云自己的流控与日/月限额。本站 60 秒冷却通常先于它触发；持续出现说明该号码在别处也被刷 |
+| `isp.SYSTEM_ERROR` | 阿里云侧故障。可让用户稍后手动重发，本站**不自动重试**（见下） |
+
+HTTP 4xx 时响应体通常仍是同一份 JSON，`AliyunSmsSender` 按 `Code` 判而不仅看状态码；
+返回 HTML（网关错误页）时报 `BadResponse` 并只留 200 字预览。
+
+**费用、重试与限额**
+
+- 国内短信按条计费，套餐包比按量便宜；计费看控制台账单，上线前先估量（每次登录/绑定一条）。
+- **SendSms 没有幂等键**：客户端超时后重试，用户可能收到两条，所以发出后不自动重试；
+  本地判失败（连不上、非 OK、缺配置）会调 `discard()` 回滚配额与冷却，用户可以立刻再点一次，
+  而不是被「今日次数已达上限」挡在真实原因前面。
+- 阈值都在 `application.yml` 的 `platform.sms.code.*`：有效期 5 分钟、同号码同用途冷却 60 秒、
+  一个码最多校验失败 5 次、每号码每天 10 条、每来源 IP 每小时 20 次。改阈值不用改代码，同名环境变量即可覆盖
+  （如 `PLATFORM_SMS_CODE_DAILY_LIMIT_PER_PHONE=5`）。
+- 计数全在 Redis（`sms:code:*` / `sms:try:*` / `sms:cd:*` / `sms:quota:phone:*` / `sms:quota:ip:*`），
+  **Redis 被 flush 等于冷却与日限额清零**；Redis 不可用时手机号登录整体失败（密码登录不受影响）。
+- Redis 里存的是验证码的 SHA-256，不是明文；登录码与绑定码按用途分键，互不通用。
+- 手机号与账号一对一：`V7` 迁移给 `sys_user.phone` 加了唯一索引（可空，未绑定的账号都是 NULL，MySQL 唯一索引允许多个 NULL），
+  占用时回 `409 该手机号已绑定其他账号`；解绑必须带密码，手机丢了的人还能用密码关掉这条路。
+- 绑定/解绑**不改** `pwd_ver`（改密才改），所以手机号登录与密码登录共享同一套令牌作废语义。
+
 ## 2. 微信开放平台后台要填的东西
 
 本站对外只提供两个回调地址，路径固定：
@@ -168,7 +297,7 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
 
 | 前缀 | 说明 |
 | --- | --- |
-| `/api/auth/*` | 登录、当前用户、改密（`login` 免鉴权；`PUT /password` 成功即作废调用方自己那枚令牌） |
+| `/api/auth/*` | 登录、当前用户、改密、手机号绑定（`login`/`sms-code`/`login-sms` 免鉴权，其余都要令牌；`PUT /password` 成功即作废调用方自己那枚令牌；`POST /phone/sms-code`、`PUT /phone`、`DELETE /phone` 分别是绑定取码、绑定、解绑） |
 | `/api/platform/*` | 平台凭据、健康检查、ticket 列表、重新开启推送、`domains/{kind}`（`server`/`jump`，第三方平台账号自身的域名白名单） |
 | `/api/authorizers/*` | 授权小程序列表/详情/刷新/同步/解除、授权会话 |
 | `/api/authorizers/{appid}/…` | `code` `experience-qrcode` `pages` `code-info` `audit*` `publish` `gray-release*` `revert*` `release/*` |
@@ -178,6 +307,8 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
 | `/wx/callback` `/wx/callback/{appid}` `/wx/auth/callback` | 微信侧回调，非前端接口。裸路径收票据与授权事件；`{appid}` 是「消息与事件接收 URL」里 `$APPID$` 被微信替换后的形式，收小程序侧消息与事件；`/wx/auth/callback` 授权完 302 回 `/authorizers` |
 
 响应统一 `{code, message, data}`，`code=0` 为成功；微信的 `errcode` 原样透传在 `code` 里，便于前端按错误码提示。
+`BizException` 只有 401/403/404 会把 HTTP 状态一起改掉，**其余业务码（如验证码的 429/409/502）是信封里的码，HTTP 仍是 400**，
+所以前端按码分流时要读 `error.payload.code`，读 `error.code` 只会拿到 400。
 鉴权：`Authorization: Bearer <token>`；`<img>` 类 GET 接口支持 `?token=` 便于直接展示二维码。
 
 ## 5. 已知约束
@@ -194,6 +325,21 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
 - 改密只允许本人改（`PUT /api/auth/password`，参数只有 `oldPassword`/`newPassword`），不提供管理员代改；
   原密码不符回 403 且不改库，新密码要求 8-64 位且不得与原密码相同。界面拿到成功就本地清会话跳登录页——
   此时再调 `/logout` 是用一枚已经作废的令牌。
+- 手机号登录这条通道**不给探测者留区分依据**：验证码错、已过期、这个号没绑过账号，三种情况合成一句
+  「手机号或验证码不正确」（都是 401），所以拿不到「哪些号码注册过」。取码接口无论号码有没有绑定，响应完全一样
+  （冷却秒数与有效期），只在日志里记一笔「手机号未绑定任何账号，跳过短信发送」——回「该号未注册」同样是泄露。
+- `/api/auth/login`、`/api/auth/sms-code`、`/api/auth/login-sms` 是 `AuthInterceptor` 的**唯一免鉴权例外**
+  （`WebConfig.excludePathPatterns`），绑定/解绑与 `/auth/me` 都要令牌。免鉴权接口是爬虫与监控的必打目标，
+  空 body 与半截 JSON 会抛 `HttpMessageNotReadableException`，此前落进 `handleOther` 是整段栈 + 500，
+  现已单列成一行 WARN + `400 请求体缺失或不是合法的 JSON`。
+- 短信通道未启用时验证码明文进日志，**这是给开发的兜底而不是可上线的状态**；`platform.sms.enabled=true` 时
+  `AliyunSmsSender` 才装载（`@ConditionalOnProperty`），界面上的失败只回「验证码发送失败，请稍后重试」，
+  阿里云的 `Code`/`Message`/`RequestId` 只进 ERROR 日志——供应商原文里会有 AccessKey 状态与模板信息，不该出现在响应体。
+- 阿里云 SendSms **没有幂等键**：一次调用一次计费，超时后自动重试就是重复发送。因此发送失败绝不重试，
+  只 `discard()` 回滚冷却与配额让用户手动再点；Redis 是这条链路的硬依赖（冷却/限额/验证码都在里面），
+  flush 掉等于闸门清零。
+- 短信这条链路只能验到「拼装正确」为止：签名由官方签名器的黄金向量锁住、请求体与响应分型由 `MockWebServer` 锁住，
+  但**真实 AccessKey 是否被阿里云接受、签名/模板是否审核通过、号码能否收到，必须用真凭据在生产上验一次**（见 §7）。
 - 体验版二维码、审核状态等接口有微信侧频控/日配额，超限报 `45009`/`45011`。
 - `get_audit_status` 只能查最近若干条，历史审核详情以 `wechat_audit_record` 落库记录为准。
 - 「加速审核」每次消耗第三方平台的加急额度，站内不校验剩余额度，超限由微信返回错误码原样提示；
@@ -269,7 +415,7 @@ server { listen 80; server_name platform.example.com; return 301 https://$host$r
 ## 6. 测试
 
 ```bash
-mvn -B test          # 223 个用例：204 个无需中间件 + 19 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
+mvn -B test          # 270 个用例：250 个无需中间件 + 20 个连本机 MySQL/Redis 的 E2E（详见 §1.2）
 ```
 
 | 测试类 | 锁住的东西 |
@@ -288,8 +434,12 @@ mvn -B test          # 223 个用例：204 个无需中间件 + 19 个连本机 
 | `PlatformConfigSerializationTest` | 密钥不进 toString/日志/响应，PUT 的明文密钥能正常绑定 |
 | `PlatformConfigServiceTest` | 单行配置不自动补默认域名（否则 `WECHAT_API_BASE` 失效）、空串能清掉覆盖项、缺字段保持原值 |
 | `PlatformAuthPasswordTest` | 改密的每条分支与令牌版本作废（8 例）：改密必须重新哈希且 `pwd_ver` +1、原密码不符只回 403 且**一次 update 都不发**、弱长度/与原密码相同/空值三类在本地拦住并回原文案、没有登录上下文时不许改；签发的令牌里 `pv` 与库里一致才放行（含 `pwd_ver` 为 NULL 按 0 处理、账号被禁用回「已被禁用」） |
-| `PlatformWebContractTest` | Controller 参数绑定、微信 errcode 与 HTTP 状态的映射、分页信封、平台密钥只回掩码、`PUT /auth/password` 两个字段能绑进请求体且原密码不符映射成 HTTP 403 |
-| `PlatformEndToEndTest` | 从扫码授权到发布/灰度/回退的完整链路（桩微信 + 真库表），含操作日志按 `commit`/`release` 等微信接口名精确检索、撤回与加速审核（含不传 `auditId` 的回落）、小程序码在真 MySQL 上的 `MEDIUMBLOB` 字节往返（`V5` 迁移建表 + 第二次读取零微信请求 + `refresh=true` 才回源）、服务类目走完整 HTTP 栈（桩按文档回扁平表 → `GET /all-categories` 仍是组装好的两级树、含 `sensitive_type` 与资质名 → `POST /categories` 发 `{first, second}` 到 `/cgi-bin/wxopen/addcategory`）、改密走完整 HTTP 栈（`V6` 的 `pwd_ver` 在真库上生效：改密前签发的令牌再调接口直接 401「密码已修改」、旧密码登不进去、新密码登录后接口才放行，用例跑完把密码还原回默认值） |
+| `SmsSignatureTest` | 阿里云 RPC 签名 V1 本身：与官方签名器逐字节对齐的两条黄金向量（中文签名名 + JSON 模板参数、含 `*~ /` 与空格的保留字符）、百分号编码按 RFC 3986（空格是 `%20` 而不是表单编码的 `+`）、参数字符串排序与插入顺序无关 |
+| `AliyunSmsSenderContractTest` | SendSms 出站契约（`MockWebServer`，6 例）：POST `application/x-www-form-urlencoded` 且带全 `Action`/`Version=2017-05-25`/`RegionId`/`SignatureNonce`/`Timestamp`/`PhoneNumbers`/`SignName`/`TemplateCode`/`TemplateParam`/`Signature`、显式 Content-Length、**只有 `Code=="OK"` 算成功**并读出 `BizId`、模板变量名跟随 `template-param-key`、非 OK 按 `Code` 抛 `SmsSendException`、4xx 仍带 JSON 体时按体判而不是看状态码、HTML 响应归 `BadResponse`、缺凭据时在任何 HTTP 请求发出前就拒（请求数为 0） |
+| `SmsCodeServiceTest` | 验证码策略（14 例，Redis 用内存替身）：签发只落 SHA-256 且三类键 TTL 各自正确、冷却期内重发拒绝并回剩余秒数、每号码第 11 条与每 IP 第 21 次分别被日/小时限额挡下、验证码一次一废、5 次校验失败即作废、尝试计数键继承验证码剩余 TTL、login 码与 bind 码互不通用且冷却相互独立、`discard()` 把码与两处配额一起回滚、空码直接拒、没签发过就校验失败、默认阈值与 `platform.sms.code.*` 覆盖值 |
+| `AuthServiceSmsLoginTest` | 手机号登录与绑定（17 例）：短信登录与密码登录走同一个会话出口（令牌一样带 `pwd_ver`）、验证码错/号码未绑/已过期回**同一句** 401、空值与格式错在消耗验证码之前就拦住、`+86` 与空格短横线先归一再查库、账号禁用即使码对也回 403、取码响应与号码有没有绑定完全一致、发送失败回滚配额且不把供应商原文透到界面、绑定码必须带登录上下文、密码错不烧掉这次验证码、只有码通过才写库、号码被他人占用回 409、重绑自己已绑的号码允许、解绑用显式 `set(phone, null)` 清空列且解绑必须带密码 |
+| `PlatformWebContractTest` | Controller 参数绑定、微信 errcode 与 HTTP 状态的映射、分页信封、平台密钥只回掩码、`PUT /auth/password` 两个字段能绑进请求体且原密码不符映射成 HTTP 403、`POST /auth/sms-code` 的 `phone` 与请求远端 IP 绑定、`POST /auth/login-sms` 的 401 映射、**429/409/502 只存在于信封 `code` 而 HTTP 恒 400**、`/auth/phone/sms-code` + `PUT`/`DELETE /auth/phone` 三条路由、免鉴权接口上空 body/坏 JSON 回 400 而不是 500 |
+| `PlatformEndToEndTest` | 从扫码授权到发布/灰度/回退的完整链路（桩微信 + 真库表），含操作日志按 `commit`/`release` 等微信接口名精确检索、撤回与加速审核（含不传 `auditId` 的回落）、小程序码在真 MySQL 上的 `MEDIUMBLOB` 字节往返（`V5` 迁移建表 + 第二次读取零微信请求 + `refresh=true` 才回源）、服务类目走完整 HTTP 栈（桩按文档回扁平表 → `GET /all-categories` 仍是组装好的两级树、含 `sensitive_type` 与资质名 → `POST /categories` 发 `{first, second}` 到 `/cgi-bin/wxopen/addcategory`）、改密走完整 HTTP 栈（`V6` 的 `pwd_ver` 在真库上生效：改密前签发的令牌再调接口直接 401「密码已修改」、旧密码登不进去、新密码登录后接口才放行，用例跑完把密码还原回默认值）、手机号绑定与短信登录走完整 HTTP 栈（`V7` 的 `phone` 列与唯一索引在真 MySQL 上可用：未在册号码取码时响应一致但**桩收到的请求数不涨**、绑定码不能当登录码用（401）、60 秒内重取是 `HTTP 400 + 信封 429`、`/auth/me` 只回掩码不回完整号码、密码错先 403 且不消耗验证码、绑定后不带密码登录成功、解绑后该号码登录回到 401，短信侧由 `MockWebServer` 桩出 `Code=OK` 并从 `TemplateParam` 里读回真实码） |
 
 已在本机连真库、连真微信域名验证过（2026-11-17）：登录、凭据保存且只回掩码、安全模式的回调 URL 校验与票据推送
 （含签名不符仍回 `success`、`/wx/callback/{appid}` 代收路径）、健康检查真实请求 `api.weixin.qq.com`
@@ -594,9 +744,34 @@ E2E 仍是 18 例但断言全部换到文档形状上；前端 `vue-tsc` + `npm 
 leave 过渡永远不结束，于是校验错误节点会以 `opacity:0`、高度 0 的形式滞留在 DOM 里——只看 `.el-form-item__error` 是否存在
 就会误判「错误提示清不掉」，读数必须按 `getComputedStyle(...).opacity` 与实际高度过滤（`is-success` 类与 `form.validate()` 返回 `true` 才是状态真相）。
 
+手机号验证码登录这一轮补了 47 例（后端 223 → 270 全绿 = 250 免中间件 + 20 E2E）。签名部分不是「自己实现自己验」：
+`SmsSignatureTest` 的两条期望值取自阿里云官方 `aliyun-python-sdk-core` 2.16.1 的
+`aliyunsdkcore/auth/composer/rpc_signature_composer.py`（`__compose_string_to_sign`）与 `sha_hmac1.get_sign_string`
+对同一组钉死 Nonce/Timestamp 的参数算出的结果，覆盖中文签名名、JSON 模板参数与 `* + / ~` 空格 `%` 这类保留字符，
+因此百分号编码写成表单编码（空格变 `+`、`*` 没转、`~` 被多转）会立刻红。
+这么绕是因为**没有真实 AccessKey 时探针问不出签名对不对**：阿里云先查 `AccessKeyId` 再验签名，
+假 key 永远停在 `InvalidAccessKeyId.NotFound`，数学等价向量是本地唯一能守住这条的路径。
+发送侧 6 例锁的是「`Code=="OK"` 才算成功」与「4xx 也要按响应体的 `Code` 判」——只看 HTTP 状态的话，参数错误会被当成网络故障，
+运维会去查出口网络而不是去改 `.env`；缺凭据那条用例靠请求数为 0 守住「在本地就拒」，因为一个能发到阿里云的错误请求本身就在计费。
+策略 14 例守的是配额闸门（冷却按「用途 + 号码」计、日/小时限额、5 次失败作废、尝试键继承剩余 TTL、`discard()` 三处一起回滚），
+服务 17 例守的是不被探测的响应形状与绑定/解绑的密码要求。
+
+浏览器实测（`target/scratch/uistub.mjs` 复刻后端形状，含「429/409/502 只在信封里、HTTP 仍是 400」这条最容易搞错的拆分）：
+`+86 138 0013 8000` 输进去后输入框与出站 body 都是 `13800138000`，号码不合法时按钮点了但 `uistub-access.log` 里没有对应请求；
+点「获取验证码」进入 60 秒倒计时、期间按钮 `disabled` 且一个请求都不发；桩回 `请 37 秒后再试` 时倒计时按 37 秒起步而不是重置成 60；
+码错时页面内联显示「手机号或验证码不正确」，不跳登录页、不写令牌；通道故障（502）只在弹窗里显示一句话且不启动倒计时。
+绑定弹窗四个分支都过：成功（提示「手机号已绑定，下次可用验证码登录」+ 顶栏重新拉到 `phoneMasked`）、
+号码被占（409 文案原样显示、不重复弹全局 toast）、密码错（403「密码不正确」且验证码没被消耗）、解绑（提示后 `/auth/me` 不再回 `phoneMasked`）。
+本轮踩到的三点值得记下：`FormDialog` 的 `#footer-left` 插槽在 DOM 里排在**取消/确认之前**，
+按「最后一个按钮」取确认结果误点了「解绑手机号」；本机 8080 已被另一个项目的后端占用，桩改跑 8390 并直接托管 `dist`，
+不去动别人的进程；这个项目没有 `tsconfig.app.json`，类型检查只跑 `vue-tsc --noEmit`。
+另外页签 hidden 时 `el-dialog` 的 leave 过渡不会结束（节点滞留在 DOM），判断弹窗是否关闭要看 `dialog-fade-leave-active` 这个类而不是看节点存不存在（§6 前一轮已记过一次，这轮又踩）。
+
 仍只能等真实凭据与备案域名才能验证：真实 `component_appid`/`component_secret` 换取 token、出口 IP 白名单（缺失报 `40164`）、
 公网 https 备案域名的微信侧校验、已备案小程序才允许发布、宿主机 nginx 的证书链与 `/wx/` 透传（compose 已不含 caddy）。
 第三方平台的加急额度余量也没有可查接口，用超了只能等微信返回错误码。
+短信同理：真实 AccessKey 能否被受理、签名与模板的审核状态、号码最终有没有投递到用户手机上，本地一律问不出来
+（`MockWebServer` 只证明本站把请求拼对了、把响应读对了），上线时按 §1-5 与 §7 的那一步真发一条确认。
 
 ## 7. 接真实凭据后的上线验收清单
 
@@ -605,8 +780,8 @@ leave 过渡永远不结束，于是校验错误节点会以 `opacity:0`、高�
 
 0. **部署自检**：`curl https://<域名>/wx/health` 回 `ok` —— 同时证明 api 镜像是重新构建的、宿主机 nginx 的 `/wx/` 透传正常；
    `docker compose logs api` 里不该再有每 30 秒一条的 `timestamp` 缺参异常，业务失败现在都是一行 `业务异常 ... message=...`。
-   若小程序码报「后端没有这个接口」，就是 `docker compose build api` 没跑或没生效。日志里还应看到 Flyway 把架构升到 `6 - sys user pwd ver`；
-   没跑这一条迁移，改密就只能挡住「新的一次登录」，旧令牌照旧活到 TTL。
+   若小程序码报「后端没有这个接口」，就是 `docker compose build api` 没跑或没生效。日志里还应看到 Flyway 把架构升到 `7 - sys user phone`
+   （`6` 是 `pwd_ver`）；没跑 `V7` 就没有 `sys_user.phone` 列，手机号登录整条链路不可用，改密也只能挡住「新的一次登录」。
 1. **凭据落库 + 票据**：按 `deploy/docker-compose.yml` 的 `environment` 列出哪些要填，在 `deploy/` 下本地新建 env 填真实
    `component_appid`/`component_secret`/消息加解密密钥与 `aes_key`（仓库里不放 env 文件，也不要把密钥抄进任何提交物），
    同一份 env 里 `PLATFORM_JWT_SECRET` 也要填——留空时登录令牌的密钥每次启动随机生成，**每次重启所有人都得重新登录**。
@@ -632,4 +807,30 @@ leave 过渡永远不结束，于是校验错误节点会以 `opacity:0`、高�
 6. **灰度与回退**：灰度发布后「发布 / 灰度」面板应回显「执行中 · N%」（比例只来自 `getgrayreleaseplan`，微信的 `grayrelease` 响应里没有它）；
    结束灰度后回到「执行完毕 · 100%」。若商家直接在小程序后台收尾，本地 `GRAY` 会在下一次读计划时被纠正成已上线，界面会写明原因。
 
+**另：手机号验证码登录（只依赖阿里云，可与上面 1–6 步并行验收）**
+
+1. `deploy/.env` 里 5 项填齐且 `PLATFORM_SMS_ENABLED=true`，`docker compose up -d api`；
+   取一次码后 `docker compose logs api` 里不该出现「短信通道未启用」——那一行是 `LoggingSmsSender` 在替你确认 env 没生效
+   （它只在发码那一刻打，不在启动时打）。
+2. 密码登录 →「手机号登录」绑定一个真实能收信的号码，然后：
+
+   ```bash
+   docker compose logs api | grep -E "验证码已签发|验证码短信已提交阿里云"
+   ```
+
+   要看到 `bizId=`（阿里云已受理）。没有 `bizId` 而是 `验证码短信发送失败 providerCode=…`，按 §1-5 的对照表处置：
+   `isv.*` 是签名/模板/号码问题（改配置），`SignatureDoesNotMatch`/`InvalidTimeStamp.Expired` 是密钥与时钟，
+   `isv.AMOUNT_NOT_ENOUGH` 是余额。手机没收到但拿到 `bizId` 时去控制台「发送记录查询」按 `BizId` 看投递结果，
+   那里才是最终送达状态。
+3. 退出登录 → 「手机号验证码」页签用刚绑的号码真登一次（这步证明免鉴权放行与令牌签发都对）；
+   连着点两次「获取验证码」应进 60 秒倒计时且第二次只回冷却提示，不重复计费。
+4. 用错码登一次：界面「手机号或验证码不正确」，且**不写令牌、不跳后台**；把码输错 5 次后同一枚码应直接失效，
+   再输正确值也登不进去（防爆破）。
+5. 改一次密码：此前所有登录方式的令牌都应 401「密码已修改」，而**手机号绑定不受影响**，
+   仍可用「手机号 + 验证码」重新登录。
+6. 试一次不存在的号码取登录码：响应应与在册号码完全一致（冷却秒数 + 有效期），且日志出现
+   「手机号未绑定任何账号，跳过短信发送」、`grep` 不到对应的「验证码短信已提交阿里云」——这一步是在验你没有把在册用户名单泄露出去。
+7. 最后确认「解绑」可用（要密码）：解绑后该号码登录回 401，`/api/auth/me` 不再回 `phoneMasked`。
+
 跑通这 6 步即认为「第三方平台网站可管理开发与发布」在真实环境成立；步骤 1–3 是纯凭据问题，4–6 才需要真的代码包与备案完成的主体。
+上面那段短信验收只花几条短信的钱，不需要等微信侧的授权与备案，可以先做完把这条通道打开。

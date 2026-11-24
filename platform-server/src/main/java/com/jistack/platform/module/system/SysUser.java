@@ -14,6 +14,8 @@ public class SysUser {
     @TableId(type = IdType.AUTO)
     private Long id;
     private String username;
+    /** 手机号（规范化后的 11 位裸号），NULL 表示未绑定，也就没有验证码登录这条路 */
+    private String phone;
     private String passwordHash;
     private String nickname;
     private String role;

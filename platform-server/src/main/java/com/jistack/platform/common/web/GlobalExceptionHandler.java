@@ -5,6 +5,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.BindException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
@@ -54,6 +55,15 @@ public class GlobalExceptionHandler {
         log.warn("缺少必填参数 {} {}: {}", request.getMethod(), request.getRequestURI(), ex.getParameterName());
         return ResponseEntity.badRequest()
                 .body(ApiResponse.fail(400, "缺少必填参数：" + ex.getParameterName()));
+    }
+
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<ApiResponse<Void>> handleUnreadableBody(HttpMessageNotReadableException ex,
+                                                                 HttpServletRequest request) {
+        // 免鉴权的登录/取码接口会被爬虫与监控空 body、半截 JSON 地探测；
+        // 落到 handleOther 就是整段栈 + 500，把真正的故障淹掉，所以按「客户端没写对请求体」处理。
+        log.warn("请求体缺失或格式错误 {} {}: {}", request.getMethod(), request.getRequestURI(), ex.getMessage());
+        return ResponseEntity.badRequest().body(ApiResponse.fail(400, "请求体缺失或不是合法的 JSON"));
     }
 
     @ExceptionHandler(NoResourceFoundException.class)

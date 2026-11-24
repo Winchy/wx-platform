@@ -4,11 +4,15 @@ import com.jistack.platform.wechat.crypto.WeChatMsgCrypt;
 import com.jistack.platform.wechat.crypto.XmlCodec;
 import com.jistack.platform.module.authorizer.Authorizer;
 import com.jistack.platform.module.authorizer.AuthorizerMapper;
+import com.jistack.platform.module.system.sms.PhoneNumbers;
 import com.jistack.platform.wechat.service.AuthorizationService;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import okhttp3.mockwebserver.Dispatcher;
+import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
+import okhttp3.mockwebserver.RecordedRequest;
 import org.hamcrest.Matchers;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -32,6 +36,7 @@ import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
@@ -80,6 +85,10 @@ class PlatformEndToEndTest {
     private static final MockWeChatServer WX_DISPATCHER = new MockWeChatServer();
     private static final MockWebServer WX_SERVER = new MockWebServer();
     private static final String WECHAT_API_BASE = startMock();
+    private static final MockWebServer SMS_SERVER = new MockWebServer();
+    private static final String SMS_ENDPOINT = startSmsStub();
+    private static final String SMS_SIGN_NAME = "极栈科技";
+    private static final String SMS_TEMPLATE_CODE = "SMS_E2E_0001";
     private static final String SCHEMA = "wxplat_e2e_"
             + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
 
@@ -95,6 +104,28 @@ class PlatformEndToEndTest {
         // 桩要把自己主机上的小程序码链接交给后端，客户端才允许抓取并存下来
         WX_DISPATCHER.useBaseUrl(base);
         return base;
+    }
+
+    /**
+     * 阿里云 SendSms 桩：一律回 {@code Code=OK}，请求留在 RecordedRequest 里核对报文。
+     * 验证码的明文只出现在这条报文上（Redis 里只有摘要），所以它同时也是用例取码的入口。
+     */
+    private static String startSmsStub() {
+        SMS_SERVER.setDispatcher(new Dispatcher() {
+            @Override
+            public MockResponse dispatch(RecordedRequest request) {
+                return new MockResponse()
+                        .setHeader("Content-Type", "application/json; charset=utf-8")
+                        .setBody("{\"Code\":\"OK\",\"Message\":\"OK\","
+                                + "\"BizId\":\"e2e-biz-id\",\"RequestId\":\"e2e-request-id\"}");
+            }
+        });
+        try {
+            SMS_SERVER.start();
+        } catch (IOException ex) {
+            throw new IllegalStateException("桩短信服务启动失败", ex);
+        }
+        return SMS_SERVER.url("/").toString();
     }
 
     /** 没有本机 docker compose 的 MySQL/Redis 时整类跳过，避免无基础设施的环境误报。 */
@@ -116,11 +147,19 @@ class PlatformEndToEndTest {
         registry.add("spring.datasource.url", () -> "jdbc:mysql://127.0.0.1:3306/" + SCHEMA
                 + "?createDatabaseIfNotExist=true&useUnicode=true&characterEncoding=utf8"
                 + "&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true");
+        // 让 AliyunSmsSender 真的装载并把报文发到桩上；桩不验签，签名算法由 SmsSignatureTest 的黄金向量守
+        registry.add("platform.sms.enabled", () -> "true");
+        registry.add("platform.sms.endpoint", () -> SMS_ENDPOINT);
+        registry.add("platform.sms.access-key-id", () -> "e2e-access-key-id");
+        registry.add("platform.sms.access-key-secret", () -> "e2e-access-key-secret");
+        registry.add("platform.sms.sign-name", () -> SMS_SIGN_NAME);
+        registry.add("platform.sms.template-code", () -> SMS_TEMPLATE_CODE);
     }
 
     @AfterAll
     static void stopMock() throws IOException {
         WX_SERVER.shutdown();
+        SMS_SERVER.shutdown();
         dropEphemeralSchema();
     }
 
@@ -286,6 +325,141 @@ class PlatformEndToEndTest {
         api(HttpMethod.PUT, "/api/auth/password", Map.of("oldPassword", newPasswd, "newPassword", "admin123"));
         login();
         assertThat(api(HttpMethod.GET, "/api/auth/me", null).path("username").asText()).isEqualTo("admin");
+    }
+
+    @Test
+    @DisplayName("手机号验证码：绑定 → 验证码登录 → 解绑，全程真库真 Redis，短信发到桩上")
+    void smsPhoneBindLoginAndUnbind() throws Exception {
+        // 冷却是按「用途 + 号码」计的，一个号码每种用途这条链路只用一次，否则后面全撞上 429
+        String phone = "139" + String.format("%08d", java.util.concurrent.ThreadLocalRandom.current()
+                .nextInt(100_000_000));
+        String unboundPhone = "138" + String.format("%08d", java.util.concurrent.ThreadLocalRandom.current()
+                .nextInt(100_000_000));
+        // 冷却与当日配额是跨用例、跨运行留下的状态，先把计数清空
+        clearSmsCache();
+
+        // 1) 未在册的号码取登录码：响应必须和在册一模一样，但一条短信都不发
+        int beforeRegistered = SMS_SERVER.getRequestCount();
+        mvc.perform(MockMvcRequestBuilders.post("/api/auth/sms-code")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of("phone", unboundPhone))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(0))
+                .andExpect(jsonPath("$.data.cooldownSeconds").value(60))
+                .andExpect(jsonPath("$.data.expiresIn").value(300));
+        assertThat(SMS_SERVER.getRequestCount())
+                .as("号码没绑过时发短信，等于把这个号在册与否告诉了任何人").isEqualTo(beforeRegistered);
+
+        // 2) 登录后取绑定用验证码：这条一定真发，报文里的 TemplateParam 就是用户收到的明文码
+        api(HttpMethod.POST, "/api/auth/phone/sms-code", Map.of("phone", phone));
+        String bindCode = lastSmsCode(phone);
+
+        // 密码不对先挡掉：此时验证码还没被消耗，下一步还能用它绑成
+        mvc.perform(MockMvcRequestBuilders.put("/api/auth/phone")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(
+                                Map.of("phone", phone, "code", bindCode, "password", "not-the-password"))))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value(403));
+
+        api(HttpMethod.PUT, "/api/auth/phone", Map.of("phone", phone, "code", bindCode, "password", "admin123"));
+        assertThat(api(HttpMethod.GET, "/api/auth/me", null).path("phoneMasked").asText())
+                .isEqualTo(PhoneNumbers.mask(phone));
+        // 库里存的是完整号码，接口只回掩码
+        assertThat(rawBody("/api/auth/me")).doesNotContain(phone).contains(PhoneNumbers.mask(phone));
+
+        // 3) 60 秒内再要同用途的码：429 只在信封里，HTTP 仍是 400
+        mvc.perform(MockMvcRequestBuilders.post("/api/auth/phone/sms-code")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of("phone", phone))))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value(429))
+                .andExpect(jsonPath("$.message", Matchers.containsString("秒后再试")));
+
+        // 绑定用验证码是登录用不了的第二把锁：用途分键
+        mvc.perform(MockMvcRequestBuilders.post("/api/auth/login-sms")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of("phone", phone, "code", bindCode))))
+                .andExpect(status().isUnauthorized());
+
+        // 4) 免鉴权取登录码 → 不带密码直接登录；错码先拒，同一个码第二次也算用过
+        api(HttpMethod.POST, "/api/auth/sms-code", Map.of("phone", phone));
+        String loginCode = lastSmsCode(phone);
+        // 首位取反，保证这个码和签发的那一枚不可能相同（否则用例自己把自己撞成偶发失败）
+        String wrongCode = (loginCode.charAt(0) == '1' ? '2' : '1') + loginCode.substring(1);
+        mvc.perform(MockMvcRequestBuilders.post("/api/auth/login-sms")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of("phone", phone, "code", wrongCode))))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.message").value("手机号或验证码不正确"));
+
+        String smsToken = api(HttpMethod.POST, "/api/auth/login-sms",
+                Map.of("phone", phone, "code", loginCode)).path("token").asText();
+        mvc.perform(MockMvcRequestBuilders.get("/api/auth/me")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + smsToken))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.username").value("admin"));
+        mvc.perform(MockMvcRequestBuilders.post("/api/auth/login-sms")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of("phone", phone, "code", loginCode))))
+                .andExpect(status().isUnauthorized());
+
+        // 5) 解绑要密码；解完掩码消失、这条登录入口当场断掉
+        mvc.perform(MockMvcRequestBuilders.delete("/api/auth/phone")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of("password", "not-the-password"))))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value(403));
+        api(HttpMethod.DELETE, "/api/auth/phone", Map.of("password", "admin123"));
+        // 清空靠的是显式 SET phone = NULL：换成 updateById 会跳过 null 字段，掩码会一直挂在接口上
+        assertThat(api(HttpMethod.GET, "/api/auth/me", null).has("phoneMasked")).isFalse();
+        mvc.perform(MockMvcRequestBuilders.post("/api/auth/login-sms")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of("phone", phone, "code", loginCode))))
+                .andExpect(status().isUnauthorized());
+        // 「号码不再在册就不发短信」在第 1 步用另一个号码验过了；这里同一号码的登录冷却还没过，
+        // 再取一次只会撞上第 3 步那道 429，问不出新问题
+    }
+
+    /** 桩收到的最后一次 SendSms 报文：核对线上参数，并把用户那条短信里的明文码取出来。 */
+    private String lastSmsCode(String phone) throws Exception {
+        RecordedRequest request = SMS_SERVER.takeRequest(5, TimeUnit.SECONDS);
+        assertThat(request).withFailMessage("桩短信服务没收到 SendSms 请求").isNotNull();
+        assertThat(request.getRequestLine()).startsWith("POST ");
+        Map<String, String> form = formFields(request.getBody().readUtf8());
+        assertThat(form).containsEntry("Action", "SendSms")
+                .containsEntry("Version", "2017-05-25")
+                .containsEntry("PhoneNumbers", phone)
+                .containsEntry("SignName", SMS_SIGN_NAME)
+                .containsEntry("TemplateCode", SMS_TEMPLATE_CODE);
+        assertThat(form.get("Signature")).isNotBlank();
+        assertThat(form.get("Timestamp")).matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z");
+        String code = json.readTree(form.get("TemplateParam")).path("code").asText();
+        assertThat(code).matches("\\d{6}");
+        return code;
+    }
+
+    private static Map<String, String> formFields(String body) {
+        Map<String, String> fields = new LinkedHashMap<>();
+        for (String pair : body.split("&")) {
+            int split = pair.indexOf('=');
+            if (split > 0) {
+                fields.put(URLDecoder.decode(pair.substring(0, split), StandardCharsets.UTF_8),
+                        URLDecoder.decode(pair.substring(split + 1), StandardCharsets.UTF_8));
+            }
+        }
+        return fields;
+    }
+
+    /** 验证码状态都在 Redis db9 的 sms:* 下，用例之间必须从干净状态开始。 */
+    private void clearSmsCache() {
+        Set<String> keys = redis.keys("sms:*");
+        if (keys != null && !keys.isEmpty()) {
+            redis.delete(keys);
+        }
     }
 
     // ------------------------------------------------------------------ 回调

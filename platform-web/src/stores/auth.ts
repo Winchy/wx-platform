@@ -1,7 +1,15 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
-import { fetchCurrentUser, login as loginApi, logout as logoutApi, type LoginParams, type UserInfo } from '@/api/auth'
+import {
+  fetchCurrentUser,
+  login as loginApi,
+  loginBySms as loginBySmsApi,
+  logout as logoutApi,
+  type LoginParams,
+  type SmsLoginParams,
+  type UserInfo
+} from '@/api/auth'
 import { clearToken, describeError, getToken, setToken } from '@/utils/request'
 
 const USER_STORAGE_KEY = 'wx_platform_user'
@@ -49,6 +57,13 @@ export const useAuthStore = defineStore('auth', () => {
     return result.token
   }
 
+  /** 验证码登录拿到的令牌与密码登录同源（claim 里同样带 pwd_ver），所以会话处理完全一致 */
+  async function loginBySms(params: SmsLoginParams): Promise<string> {
+    const result = await loginBySmsApi(params)
+    setSession(result.token, result.user ?? null)
+    return result.token
+  }
+
   async function loadUser(): Promise<boolean> {
     if (!token.value) return false
     try {
@@ -80,6 +95,7 @@ export const useAuthStore = defineStore('auth', () => {
     setSession,
     reset,
     login,
+    loginBySms,
     loadUser,
     logout
   }

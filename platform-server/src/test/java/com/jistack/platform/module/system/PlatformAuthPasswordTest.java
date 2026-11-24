@@ -3,6 +3,7 @@ package com.jistack.platform.module.system;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jistack.platform.common.config.PlatformProperties;
 import com.jistack.platform.common.web.BizException;
+import com.jistack.platform.module.system.sms.SmsSender;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -51,7 +52,7 @@ class PlatformAuthPasswordTest {
         stored.setPwdVer(3);
         when(userMapper.selectById(any())).thenReturn(stored);
         tokens = tokenService();
-        service = new AuthService(userMapper, tokens);
+        service = new AuthService(userMapper, tokens, mock(SmsCodeService.class), mock(SmsSender.class));
         RequestContext.set(new RequestContext.Principal(1L, "admin", "ADMIN", 3));
     }
 
